@@ -29,8 +29,8 @@ jobs:
         id: check
         run: |
           # Get latest release from llama.cpp
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
-          RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.tag_name')
+          RELEASE_HASH=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.target_commitish')
           
           echo "Latest llama.cpp release: $LATEST_RELEASE"
           echo "Release hash: $RELEASE_HASH"
@@ -64,7 +64,7 @@ jobs:
           # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
           # multi-arch on Docker Hub so the same build path runs on both.
           - { suffix: amd64, runs_on: ubuntu-latest }
-          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
+#          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
         include:
           - cuda_version: '12.8.1'
             cuda_version_short: '12.8'
@@ -111,7 +111,7 @@ jobs:
           echo "=== After Cleanup ==="
           df -h
 
-      - name: Build llama.cpp with CUDA
+      - name: Build Colibri with CUDA
         run: |
           # Pull Docker image
           docker pull nvidia/cuda:${{ matrix.cuda_tag }}
@@ -125,47 +125,42 @@ jobs:
               
               echo '=== Installing minimal dependencies ==='
               apt-get update -qq
-              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+              apt-get install -y --no-install-recommends git make build-essential libssl-dev ca-certificates
               apt-get clean
               rm -rf /var/lib/apt/lists/*
               
-              echo '=== Cloning llama.cpp ==='
+              echo '=== Cloning Colibri ==='
               cd /workspace
-              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
-                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
-              cd llama.cpp
+              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/JustVugg/colibri.git || \
+                (git clone https://github.com/JustVugg/colibri.git && cd colibri && git checkout ${{ needs.check-release.outputs.release_hash }})
+              cd colibri
               
               echo '=== Configuring build with Ninja ==='
               export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
               ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-              cmake -B build -S . \
-                -G Ninja \
-                -DGGML_CUDA=ON \
-                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_SHARED_LIBS=ON \
-                -DGGML_NATIVE=OFF \
-                -DLLAMA_BUILD_TESTS=OFF \
-                -DLLAMA_BUILD_EXAMPLES=OFF \
-                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+              CUDA=1 make -C c qwen38
               
-              echo '=== Building with Ninja (parallel: all cores) ==='
-              cmake --build build --config Release -j\$(nproc)
+              #echo '=== Building with Ninja (parallel: all cores) ==='
+              #make --build build --config Release -j\$(nproc)
               
               echo '=== Copying binaries ==='
               cd /workspace
               mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
-
+              
+              # Remove everything except binaries
+              rm -fr colibri/c/*.c
+              
               # Copy everything from build/bin
-              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+              cp -r colibri/c/* binaries/cuda-${{ matrix.cuda_version_short }}
+              
 
+              
               # Strip binaries to reduce size (executables only, not .so files)
               find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
               echo '=== Creating version info ==='
-              echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
@@ -175,7 +170,7 @@ jobs:
               ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
               
               echo '=== Cleaning up build directory ==='
-              rm -rf llama.cpp
+              rm -rf colibri
             "
           
           # Remove Docker image to free space
@@ -190,7 +185,7 @@ jobs:
       - name: Create tarball
         run: |
           cd binaries
-          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          tar -czf colibri-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
           ls -lh *.tar.gz
 
       - name: Upload artifact
@@ -198,7 +193,7 @@ jobs:
         with:
           # Arch suffix in the artifact name so the matrix jobs do not collide
           # in actions/download-artifact later.
-          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
+          name: colibri-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
           path: binaries/*.tar.gz
           retention-days: 1
 
@@ -242,7 +237,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty \
-            -m "llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            -m "Colibri ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
           git tag "${TAG}"
           git push origin "refs/tags/${TAG}"
 
