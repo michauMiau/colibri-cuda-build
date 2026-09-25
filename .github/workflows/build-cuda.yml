@@ -1,4 +1,4 @@
-name: Build llama.cpp with CUDA
+name: Build Colibri with CUDA
 
 on:
   schedule:
@@ -25,14 +25,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check for new llama.cpp release
+      - name: Check for new Colibri release
         id: check
         run: |
-          # Get latest release from llama.cpp
+          # Get latest release from colibri
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.tag_name')
           RELEASE_HASH=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.target_commitish')
           
-          echo "Latest llama.cpp release: $LATEST_RELEASE"
+          echo "Latest colibri release: $LATEST_RELEASE"
           echo "Release hash: $RELEASE_HASH"
           
           # Check if we've already built this release
@@ -245,13 +245,13 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.check-release.outputs.release_tag }}
-          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
+          name: colibri ${{ needs.check-release.outputs.release_tag }} with CUDA
           body: |
-            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
+            # colibri ${{ needs.check-release.outputs.release_tag }} with CUDA Support
             
-            Pre-built binaries of llama.cpp with CUDA support for multiple CUDA versions.
+            Pre-built binaries of colibri with CUDA support for multiple CUDA versions.
             
-            **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
+            **Source:** https://github.com/ggml-org/colibri/releases/tag/${{ needs.check-release.outputs.release_tag }}
             **Commit:** ${{ needs.check-release.outputs.release_hash }}
             
             ## CUDA Versions
@@ -275,10 +275,10 @@ jobs:
             Download the tarball matching your host CPU arch and CUDA version, then extract:
             ```bash
             # amd64 host
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
+            tar -xzf colibri-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
             # arm64 host (e.g. Grace Blackwell)
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
-            ./llama-cli --help
+            tar -xzf colibri-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
+            ./coli info
             ```
           files: release-assets/*
           draft: false
