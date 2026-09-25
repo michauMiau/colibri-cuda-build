@@ -92,8 +92,8 @@ jobs:
           sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
           sudo apt-get remove -y '^mysql-.*' --fix-missing || true
           sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
-          sudo apt-get autoremove -y || true
-          sudo apt-get clean || true
+          #sudo apt-get autoremove -y || true
+          #sudo apt-get clean || true
           
           echo "=== Removing large directories ==="
           sudo rm -rf /usr/share/dotnet
@@ -103,10 +103,10 @@ jobs:
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf /usr/share/swift
           sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          #sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           
           # Clean docker system
-          docker system prune -af || true
+          #docker system prune -af || true
           
           echo "=== After Cleanup ==="
           df -h
@@ -152,6 +152,9 @@ jobs:
               rm -fr colibri/c/*.c 
               rm -fr colibri/c/*.h
               rm -fr colibri/c/tests 
+              rm -fr colibri/c/shaders
+              rm -fr colibri/c/*.cmd
+              rm -fr colibri/c/*.ps1
               rm -fr colibri/c/Makefile*
               rm -fr colibri/c/*.cu
               rm -fr colibri/c/*.mm
