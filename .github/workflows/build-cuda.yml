@@ -149,15 +149,20 @@ jobs:
               mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
               
               # Remove everything except binaries
-              rm -fr colibri/c/*.c
-              
+              rm -fr colibri/c/*.c 
+              rm -fr colibri/c/*.h
+              rm -fr colibri/c/tests 
+              rm -fr colibri/c/Makefile*
+              rm -fr colibri/c/*.cu
+              rm -fr colibri/c/*.mm
+              rm colibri/c/.gitignore
               # Copy everything from build/bin
               cp -r colibri/c/* binaries/cuda-${{ matrix.cuda_version_short }}
               
 
               
               # Strip binaries to reduce size (executables only, not .so files)
-              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
+              #find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
               echo '=== Creating version info ==='
               echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
@@ -195,7 +200,7 @@ jobs:
           # in actions/download-artifact later.
           name: colibri-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
           path: binaries/*.tar.gz
-          retention-days: 1
+          retention-days: 7
 
   release:
     needs: [check-release, build]
@@ -221,7 +226,8 @@ jobs:
           find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
-      - name: Create advancing release tag
+#      - name: Create advancing release tag
+       #
         # GitHub sorts the /releases list by each release's created_at, which is
         # the *committer date of the tag's target commit* — not the publish
         # time. Previously softprops/action-gh-release created every tag at the
@@ -231,15 +237,15 @@ jobs:
         # each tag to a fresh empty commit whose committer date is build time so
         # created_at advances and new releases sort to the top of the list.
         # The commit is reachable only via its tag; main is never pushed.
-        run: |
-          set -euo pipefail
-          TAG="${{ needs.check-release.outputs.release_tag }}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty \
-            -m "Colibri ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
-          git tag "${TAG}"
-          git push origin "refs/tags/${TAG}"
+   #     run: |
+    #      set -euo pipefail
+     #     TAG="${{ needs.check-release.outputs.release_tag }}"
+      #    git config user.name  "github-actions[bot]"
+        #  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+         # git commit --allow-empty \
+          #  -m "Colibri ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+         # git tag "${TAG}"
+         # git push origin "refs/tags/${TAG}"
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
