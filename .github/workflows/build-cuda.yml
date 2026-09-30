@@ -150,36 +150,10 @@ jobs:
               # applies to the pipeline and a failed `make` exits 0 via tee.
               set -o pipefail
               CUDA=1 CUDA_ARCH=portable make -C c qwen38 2>&1 | tee /tmp/build.log
-              
+
               #echo '=== Building with Ninja (parallel: all cores) ==='
               #make --build build --config Release -j\$(nproc)
               
-              echo '=== Verifying the CUDA artifact is not a single-arch stub ==='
-              # A build with no GPU on the runner and no CUDA_ARCH=portable
-              # produces a fatbin carrying a single default arch. That still
-              # ships a .nv_fatbin section, so a size check alone passes and CI
-              # reports success. Assert on the actual arch count instead.
-              FAT=colibri/c/backend_cuda.o
-              if [ ! -f "$FAT" ]; then
-                echo "!!! $FAT missing -- nvcc never ran" >&2; exit 1
-              fi
-              if grep -qa 'Cannot find valid GPU' /tmp/build.log 2>/dev/null; then
-                echo "!!! nvcc could not resolve an arch: single-arch fatbin, binary will fault on most GPUs" >&2; exit 1
-              fi
-              # -arch=native with no GPU lands on the toolkit default (sm_52 for
-              # CUDA 12.x), which is < sm_75 -- below the project floor. A
-              # portable build starts at sm_80. Reject the low floor.
-              SM_COUNT=$(strings "$FAT" | grep -oE 'sm_[0-9]{2}' | sort -u | tr '\n' ' ')
-              echo "archs in fatbin: ${SM_COUNT:-none-labelled}"
-              # grep, not a case pattern: the whole step body is one double-quoted
-              # argument to bash -c, and a case/;; construct does not survive
-              # that quoting round-trip.
-              if printf '%s' "$SM_COUNT" | grep -qE 'sm_5[23]'; then
-                echo "!!! default/fallback arch (sm_5x) present -- CUDA_ARCH was not portable" >&2
-                exit 1
-              fi
-              ls -lh "$FAT" colibri/c/qwen38 colibri/c/coli 2>/dev/null
-
               echo '=== Copying binaries ==='
               cd /workspace
               mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
@@ -225,6 +199,32 @@ jobs:
           
           echo "=== Final disk usage ==="
           df -h
+
+      - name: Verify the CUDA artifact is not a single-arch stub
+        # Deliberately a separate step, not a block inside the bash -c above.
+        # That body is one double-quoted argument, so a $(...) inside it is
+        # not escaped for the runner's shell and blows up with "syntax error
+        # near unexpected token '('". Verified by running this workflow.
+        #
+        # A build with no GPU and no CUDA_ARCH=portable produces a fatbin
+        # carrying a single default arch (sm_52 on CUDA 12.x, below this
+        # project's sm_75 floor). It still ships a .nv_fatbin section and links
+        # libcudart, so presence and size checks both pass -- and the binary
+        # then dies at first kernel dispatch on every real card.
+        run: |
+          set -euo pipefail
+          FAT="binaries/cuda-${{ matrix.cuda_version_short }}/backend_cuda.o"
+          if [ ! -f "$FAT" ]; then
+            echo "!!! $FAT missing -- nvcc never ran" >&2
+            exit 1
+          fi
+          SM_COUNT=$(strings "$FAT" | grep -oE 'sm_[0-9]{2}' | sort -u | tr '\n' ' ')
+          echo "archs in fatbin: ${SM_COUNT:-none-labelled}"
+          if printf '%s' "$SM_COUNT" | grep -qE 'sm_5[23]'; then
+            echo "!!! default/fallback arch (sm_5x) present -- CUDA_ARCH was not portable" >&2
+            exit 1
+          fi
+          ls -lh "$FAT" binaries/cuda-${{ matrix.cuda_version_short }}/
 
       - name: Create tarball
         run: |
