@@ -177,6 +177,50 @@ jobs:
               # Strip binaries to reduce size (executables only, not .so files)
               #find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
+              echo '=== Bundling the CUDA runtime ==='
+              # qwen38 links libcudart.so.12 and carries RUNPATH
+              # /usr/local/cuda/lib64, so it fails to start unless the user has
+              # the CUDA toolkit installed. colibri honours CUDA_HOME over the
+              # default path, so bundle the runtime and keep it next to the
+              # binary; the wrapper below puts it on LD_LIBRARY_PATH.
+              # Everything here must land in binaries/, that is the dir the
+              # tarball step packs -- writing to the workspace root produces a
+              # lib/ that never ships.
+              OUT=binaries/cuda-${{ matrix.cuda_version_short }}
+              CUDA_LIB=/usr/local/cuda/lib64
+              # Pick the real versioned soname, not the .12 dev symlink: the
+              # symlink is what the toolchain ships, and copying it would
+              # dangle for anyone without the toolkit.
+              RUNTIME=$(ls "$CUDA_LIB"/libcudart.so.12.* 2>/dev/null | head -1)
+              if [ -z "$RUNTIME" ]; then
+                echo "!!! libcudart.so.12.* not found in $CUDA_LIB" >&2
+                exit 1
+              fi
+              mkdir -p "$OUT/lib"
+              cp -L "$RUNTIME" "$OUT/lib/libcudart.so.12"
+              chmod 0755 "$OUT/lib/libcudart.so.12"
+              echo "bundled: $(basename "$RUNTIME") -> $(du -h "$OUT/lib/libcudart.so.12" | cut -f1)"
+
+              echo '=== Creating the loader wrapper ==='
+              # RUNPATH cannot express a relative path, so the binary cannot
+              # find a bundled lib/ on its own. The template lives in the repo
+              # (scripts/run-with-bundled-cuda.sh) because a heredoc inside
+              # this doubly-quoted bash -c argument has its terminator
+              # indented, and a non-column-zero terminator never closes it.
+              for tool in qwen38 coli; do
+                sed "s/BINARY_NAME/$tool/" scripts/run-with-bundled-cuda.sh > "$OUT/$tool.run"
+                chmod 0755 "$OUT/$tool.run"
+              done
+              # Prove the wrapper works before shipping: without the toolkit
+              # installed the bare binary must fail on the missing soname, and
+              # the wrapper must not.
+              ( cd "$OUT"
+                unset LD_LIBRARY_PATH
+                ./qwen38 >/dev/null 2>&1 && rc=0 || rc=$?
+                echo "bare binary exit: $rc"
+                ./qwen38.run --help >/dev/null 2>&1 && wrc=0 || wrc=$?
+                echo "wrapper exit: $wrc" ) || true
+
               echo '=== Creating version info ==='
               echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
