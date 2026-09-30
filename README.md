@@ -1,146 +1,116 @@
-# llama.cpp CUDA Builds
+# Colibri with CUDA
 
-This repository automatically builds [llama.cpp](https://github.com/ggml-org/llama.cpp) with CUDA support for multiple NVIDIA GPU architectures and CUDA versions.
+Prebuilt Colibri binaries with CUDA support. Colibri's own repo
+([JustVugg/colibri](https://github.com/JustVugg/colibri)) does not publish Linux
+CUDA builds, so this repo builds one for you from each upstream release.
 
-## Why This Repository?
+This is a fork of [ai-dock/llama.cpp-cuda](https://github.com/ai-dock/llama.cpp-cuda).
+That project's README describes the original llama.cpp build. This workflow
+builds Colibri instead, and this file is the accurate one.
 
-The official llama.cpp repository does not provide pre-built CUDA binaries. This repository fills that gap by:
+## What gets built
 
-- Building llama.cpp with CUDA support for multiple CUDA toolkit versions
-- Supporting a wide range of NVIDIA GPU architectures (compute capability 7.5+)
-- Automatically tracking upstream llama.cpp releases
-- Providing ready-to-use binaries via GitHub releases
+The `qwen38` binary (Qwen3.8-Flash-Next) and the `coli` tool, from the
+upstream `c/` directory. Colibri links these as standalone executables. There is
+no shared library to install, so nothing goes on `LD_LIBRARY_PATH`.
 
-## Supported Configurations
+Tarball layout:
 
-### CUDA Versions
-- CUDA 12.8
+```
+cuda-12.8/
+  qwen38              # main CLI, links libcudart
+  coli                # helper tool
+  backend_cuda.o      # CUDA kernels, relocatable object
+  family_registry.py  # model-family metadata
+  ...                 # the upstream Python control plane and tools
+```
 
-### Host CPU Architectures
+## GPU support
 
-Each release publishes one tarball per host CPU architecture:
+Built with `CUDA_ARCH=portable`, which emits SASS for:
 
-| Suffix | Linux platform | Typical hosts |
-|--------|----------------|---------------|
-| `-amd64` | x86_64 | Most desktops, servers, cloud VMs |
-| `-arm64` | aarch64 | Grace Hopper, Grace Blackwell, DGX Spark, Ampere Altra |
-
-The CUDA compute capabilities below target the runtime GPU and are the same on both host architectures.
-
-### GPU Architectures
-
-| Compute Capability | GPU Examples |
-|-------------------|--------------|
-| 6.1 | Titan XP, Tesla P40, GTX 10xx |
-| 7.0 | Tesla V100 |
-| 7.5 | Tesla T4, RTX 2000 series, Quadro RTX |
+| Compute capability | Cards |
+|---|---|
 | 8.0 | A100 |
 | 8.6 | RTX 3000 series |
 | 8.9 | RTX 4000 series, L4, L40 |
 | 9.0 | H100, H200, GH200 |
-| 10.0 | B200, GB200 |
-| 12.0 | RTX Pro series, RTX 5000 series |
+| 12.0 | RTX 5000 series, RTX Pro |
+
+Plus a `compute_120` PTX payload, so cards newer than the table still JIT to
+native code on first run.
+
+Two older generations are deliberately missing. sm_75 (Turing) is not in the
+portable list because Colibri's `c/Makefile` starts at sm_80. sm_100 (B200) is
+missing because the list does not include it either, even though 12.8 can
+target it. If you need either, edit `CUDA_GENCODE` in `c/Makefile` and build it
+yourself, or pass your own `CUDA_ARCH`.
+
+A toolkit of 12.9 or newer adds sm_121 (GB10 Spark), because sm_121 cannot be
+compiled with 12.8.
+
+## Requirements
+
+- NVIDIA GPU, compute capability 8.0 or newer
+- NVIDIA driver 570.15 or newer, for CUDA 12.8
+- Linux x86-64
 
 ## Usage
 
-### Download
-
-1. Go to the [Releases](../../releases) page
-2. Download the tarball matching your host CPU architecture — `-amd64` for x86_64, `-arm64` for aarch64. Filename format: `llama.cpp-bXXXX-cuda-<cuda>-<arch>.tar.gz`
-3. Extract the archive:
+Grab the tarball from the releases page:
 
 ```bash
-# x86_64 host
-tar -xzf llama.cpp-bXXXX-cuda-12.8-amd64.tar.gz
-# aarch64 host (e.g. Grace Blackwell, DGX Spark)
-tar -xzf llama.cpp-bXXXX-cuda-12.8-arm64.tar.gz
+tar -xzf colibri-v1.12.1-cuda-12.8-amd64.tar.gz
 cd cuda-12.8
+
+./qwen38 --help
+./coli info
 ```
 
-### Run
+`libcudart.so.12` comes from the CUDA 12.8 runtime and has to be on the loader
+path. Install the CUDA runtime system-wide, or point the linker at the one in
+your toolkit.
 
-The extracted directory contains all llama.cpp binaries:
+## Host architectures
+
+Only `-amd64` (x86-64) is published. The arm64 matrix entry is commented out, so
+there is no arm64 tarball to download.
+
+## How the build runs
+
+Daily at 00:00 UTC, and on demand from the Actions tab. The workflow polls
+`JustVugg/colibri` for a new release tag, skips the build if that tag was
+already built, and otherwise builds it, uploads the tarball, and publishes a
+GitHub release under the upstream tag name.
+
+Force a rebuild of an already-built tag with the `force_build` input.
+
+## Verify what you downloaded
+
+The tarball is small because Colibri links statically, not because something is
+missing. To confirm the CUDA kernels are really in there:
 
 ```bash
-# Run the main CLI
-./llama-cli --help
+# the CUDA fatbin section must exist
+readelf -S backend_cuda.o | grep nv_fatbin
 
-# Run the server
-./llama-server --help
-
-# Other utilities
-./llama-bench
-./llama-quantize
-./llama-embedding
+# list the architectures it was compiled for
+strings backend_cuda.o | grep -oE 'sm_[0-9]{2}' | sort -u
 ```
 
-### Check Version
+If that second command prints only `sm_52`, you have a build from before the
+portable-arch fix, and it will fault on the first kernel dispatch. See
+[PR #1](https://github.com/michauMiau/colibri-cuda-build/pull/1).
 
-Each release includes a `VERSION.txt` file with build information:
-
-```bash
-cat VERSION.txt
-```
-
-## System Requirements
-
-- NVIDIA GPU with compute capability 7.5 or higher
-- Appropriate NVIDIA driver for your CUDA version:
-  - CUDA 12.8+: Driver >= 570.15
-- Linux x86_64 or aarch64 (Ubuntu 22.04 compatible)
-
-## Build Process
-
-Builds are triggered automatically:
-- Daily at 00:00 UTC
-- Only if a new llama.cpp release is detected
-- Can be manually triggered via GitHub Actions
-
-Each build:
-1. Checks for new llama.cpp releases
-2. Clones llama.cpp at the exact release commit
-3. Builds with CMake using CUDA Docker images
-4. Packages binaries for each CUDA version
-5. Creates a GitHub release with all build artifacts
-
-## Choosing Your CUDA Version
-
-Select based on:
-1. **Your GPU architecture** - Blackwell GPUs require CUDA 12.8+
-2. **Your installed CUDA toolkit** - Match the version if possible
-3. **Your NVIDIA driver** - Ensure your driver supports the CUDA version
-
-If unsure, CUDA 12.6.3 offers the widest compatibility with modern GPUs (except Blackwell).
-
-## Manual Building
-
-If you need a custom build:
+## Build it yourself
 
 ```bash
-git clone https://github.com/ai-dock/llama.cpp-cuda
-cd llama.cpp-cuda
-
-# Edit .github/workflows/build-cuda.yml to customize architectures or CUDA versions
-# Then trigger a manual workflow run
+git clone https://github.com/JustVugg/colibri.git
+cd colibri/c
+CUDA=1 CUDA_ARCH=portable make qwen38
 ```
 
 ## License
 
-This repository contains build scripts only. The llama.cpp binaries are subject to the [llama.cpp MIT License](https://github.com/ggml-org/llama.cpp/blob/master/LICENSE).
-
-## Links
-
-- **Upstream llama.cpp**: https://github.com/ggml-org/llama.cpp
-- **CUDA Toolkit**: https://developer.nvidia.com/cuda-toolkit
-- **NVIDIA Driver Downloads**: https://www.nvidia.com/download/index.aspx
-
-## Support
-
-For issues with:
-- **Build process or binaries**: Open an issue in this repository
-- **llama.cpp functionality**: Open an issue in the [upstream repository](https://github.com/ggml-org/llama.cpp/issues)
-
-## Credits
-
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) by Georgi Gerganov and contributors
-- Built and maintained by [ai-dock](https://github.com/ai-dock)
+Colibri's license, plus the upstream ai-dock/llama.cpp-cuda license. See
+[LICENSE](LICENSE).
