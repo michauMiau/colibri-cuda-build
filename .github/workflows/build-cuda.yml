@@ -177,54 +177,28 @@ jobs:
               # Strip binaries to reduce size (executables only, not .so files)
               #find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
-              echo '=== Bundling the CUDA runtime ==='
+              echo '=== Staging the CUDA runtime for the bundling step ==='
               # qwen38 links libcudart.so.12 and carries RUNPATH
               # /usr/local/cuda/lib64, so it fails to start unless the user has
-              # the CUDA toolkit installed.
+              # the CUDA toolkit installed. The toolkit only exists inside this
+              # container, and it is gone by the time a later step runs, so stage
+              # the runtime where the runner can reach it.
               #
-              # No shell variables in this block, on purpose. This body is one
-              # double-quoted argument to bash -c, so the RUNNER's shell eats
-              # $VAR and $( ) before the container starts. Escaping the dollar
-              # does not help either: the runner passes the backslash through
-              # too, and bash then reports a syntax error on the escaped form.
-              # Both variants were tried here and both shipped a red build, so
-              # this block uses literal paths only.
-              OUTDIR=binaries/cuda-12.8
-              CUDA_LIB=/usr/local/cuda/lib64
-              mkdir -p "$OUTDIR/lib"
-              # Copy the real versioned soname, not the libcudart.so.12
-              # symlink: that symlink is a toolchain artifact and would dangle
-              # for anyone who extracts the tarball without the toolkit.
-              set -- "$CUDA_LIB"/libcudart.so.12.*
-              if [ ! -f "$1" ]; then
-                echo "!!! no libcudart.so.12.* in $CUDA_LIB" >&2
-                exit 1
-              fi
-              cp -L "$1" "$OUTDIR/lib/libcudart.so.12"
-              chmod 0755 "$OUTDIR/lib/libcudart.so.12"
-              echo "bundled $(basename "$1") -> $(du -h "$OUTDIR/lib/libcudart.so.12" | cut -f1)"
-              ls -l "$OUTDIR/lib/"
-
-              echo '=== Creating the loader wrapper ==='
-              # RUNPATH cannot hold a relative path, so a bundled lib/ next to
-              # the binary is invisible to the loader. The wrapper sets
-              # LD_LIBRARY_PATH and CUDA_HOME, which is also what colibri's own
-              # CUDA_HOME lookup wants. The template is a repo file because a
-              # heredoc terminator indented inside this quoted argument never
-              # closes it.
-              sed 's/BINARY_NAME/qwen38/' scripts/run-with-bundled-cuda.sh > "$OUTDIR/qwen38.run"
-              sed 's/BINARY_NAME/coli/'   scripts/run-with-bundled-cuda.sh > "$OUTDIR/coli.run"
-              chmod 0755 "$OUTDIR/qwen38.run" "$OUTDIR/coli.run"
-              # Prove the wrapper before shipping: with LD_LIBRARY_PATH
-              # cleared the bare binary must fail on the missing soname, the
-              # wrapper must not.
-              cd "$OUTDIR" || exit 1
-              unset LD_LIBRARY_PATH
-              ./qwen38 >/dev/null 2>&1 && rc=0 || rc=$?
-              echo "bare binary exit: $rc"
-              ./qwen38.run --help >/dev/null 2>&1 && wrc=0 || wrc=$?
-              echo "wrapper exit: $wrc"
-              cd /workspace || exit 1
+              # Deliberately no shell variables in this block. This body is one
+              # double-quoted argument to bash -c, so the runner's shell expands
+              # $VAR and $( ) before the container starts, and escaping the
+              # dollar does not help: the backslash reaches bash too and the
+              # script stops parsing. Both forms shipped red builds. Literal
+              # paths only -- the bundling itself happens in a separate step
+              # where ordinary quoting works.
+              mkdir -p /workspace/cuda-runtime
+              cp -L /usr/local/cuda/lib64/libcudart.so.12.* \
+                    /workspace/cuda-runtime/libcudart.so.12
+              chmod 0755 /workspace/cuda-runtime/libcudart.so.12
+              # The versioned soname, not the libcudart.so.12 symlink: that
+              # symlink is a toolchain artifact and would dangle for anyone who
+              # extracts the tarball without the toolkit.
+              ls -l /workspace/cuda-runtime/
 
               echo '=== Creating version info ==='
               echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
@@ -248,6 +222,51 @@ jobs:
           
           echo "=== Final disk usage ==="
           df -h
+
+      - name: Bundle the CUDA runtime
+        # Separate from the container step on purpose. That step's body is one
+        # double-quoted argument to bash -c, so the runner's shell expands every
+        # $VAR and $( ) before the container sees it, and an escaped dollar
+        # survives as a literal backslash instead. Two runs went red on exactly
+        # that: 36792216381 (cd with an emptied argument) and 36793568938
+        # (syntax error on the escaped form). Here ordinary shell quoting works.
+        run: |
+          set -euo pipefail
+          OUT="binaries/cuda-${{ matrix.cuda_version_short }}"
+          RUNTIME=cuda-runtime/libcudart.so.12
+          if [ ! -f "$RUNTIME" ]; then
+            echo "!!! $RUNTIME not staged by the container step" >&2
+            exit 1
+          fi
+          mkdir -p "$OUT/lib"
+          install -m 0755 "$RUNTIME" "$OUT/lib/libcudart.so.12"
+          echo "bundled $(du -h "$OUT/lib/libcudart.so.12" | cut -f1)"
+
+          # RUNPATH cannot hold a relative path, so a bundled lib/ sitting
+          # next to the binary is invisible to the loader. The wrapper puts it
+          # on LD_LIBRARY_PATH and sets CUDA_HOME, which is also what colibri's
+          # own CUDA_HOME lookup reads.
+          sed 's/BINARY_NAME/qwen38/' scripts/run-with-bundled-cuda.sh > "$OUT/qwen38.run"
+          sed 's/BINARY_NAME/coli/'   scripts/run-with-bundled-cuda.sh > "$OUT/coli.run"
+          chmod 0755 "$OUT/qwen38.run" "$OUT/coli.run"
+
+          # Prove the wrapper before shipping. With LD_LIBRARY_PATH cleared the
+          # bare binary must fail on the missing soname, the wrapper must not.
+          # A wrapper that silently did nothing would ship as a broken tarball.
+          ( cd "$OUT"
+            unset LD_LIBRARY_PATH
+            ./qwen38      >/dev/null 2>&1; bare=$?
+            ./qwen38.run  --help >/dev/null 2>&1; wrapped=$?
+            echo "bare binary exit:   $bare"
+            echo "wrapper exit:       $wrapped" )
+          if [ "$wrapped" -ne 0 ]; then
+            echo "!!! the wrapper does not run the binary; refusing to ship" >&2
+            exit 1
+          fi
+          if [ "$bare" -eq 0 ]; then
+            echo "note: bare binary started, so a CUDA runtime is present on this runner"
+          fi
+          ls -lh "$OUT/" "$OUT/lib/"
 
       - name: Verify the CUDA artifact is not a single-arch stub
         # Deliberately a separate step, not a block inside the bash -c above.
@@ -274,6 +293,10 @@ jobs:
             exit 1
           fi
           ls -lh "$FAT" binaries/cuda-${{ matrix.cuda_version_short }}/
+
+      - name: Clean up the staged runtime
+        if: always()
+        run: rm -rf cuda-runtime
 
       - name: Create tarball
         run: |
