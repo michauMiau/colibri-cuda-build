@@ -11,15 +11,20 @@ builds Colibri instead, and this file is the accurate one.
 ## What gets built
 
 The `qwen38` binary (Qwen3.8-Flash-Next) and the `coli` tool, from the
-upstream `c/` directory. Colibri links these as standalone executables. There is
-no shared library to install, so nothing goes on `LD_LIBRARY_PATH`.
+upstream `c/` directory. Colibri links the CLI statically, but it still needs
+`libcudart.so.12` at load time, so that one shared library ships in the
+tarball. Nothing else is needed from CUDA.
 
 Tarball layout:
 
 ```
 cuda-12.8/
-  qwen38              # main CLI, links libcudart
-  coli                # helper tool
+  qwen38              # main CLI
+  qwen38.run          # wrapper, only needed outside this layout
+  coli                # helper tool, a Python launcher
+  coli.run
+  lib/
+    libcudart.so.12   # CUDA 12.8 runtime, taken from the build container
   backend_cuda.o      # CUDA kernels, relocatable object
   family_registry.py  # model-family metadata
   ...                 # the upstream Python control plane and tools
@@ -54,6 +59,7 @@ compiled with 12.8.
 - NVIDIA GPU, compute capability 8.0 or newer
 - NVIDIA driver 570.15 or newer, for CUDA 12.8
 - Linux x86-64
+- No CUDA toolkit. The one shared library the binary needs is in the tarball.
 
 ## Usage
 
@@ -67,9 +73,26 @@ cd cuda-12.8
 ./coli info
 ```
 
-`libcudart.so.12` comes from the CUDA 12.8 runtime and has to be on the loader
-path. Install the CUDA runtime system-wide, or point the linker at the one in
-your toolkit.
+That is the whole setup. `./qwen38` finds `lib/libcudart.so.12` on its own,
+because the build rewrites its RUNPATH to `$ORIGIN/lib`, and `$ORIGIN` is the
+directory holding the binary. No wrapper, no `LD_LIBRARY_PATH`, no `CUDA_HOME`,
+no flags.
+
+The `.run` files are only for the case where you move a binary out of this
+layout. `qwen38.run` sets `LD_LIBRARY_PATH` to the `lib/` next to it and also
+exports `CUDA_HOME`, which is what Colibri's own `CUDA_HOME` lookup reads. If you
+have CUDA installed system-wide and want that instead, `qwen38.run` respects an
+existing `LD_LIBRARY_PATH` and appends the bundle to it.
+
+If you would rather use your own runtime, delete `lib/` and let the system one
+serve. If you get an error like
+
+```
+error while loading shared libraries: libcudart.so.12: cannot open shared object file
+```
+
+then the binary is no longer next to its `lib/`, and the `.run` wrapper is what
+you want.
 
 ## Host architectures
 
@@ -101,6 +124,24 @@ strings backend_cuda.o | grep -oE 'sm_[0-9]{2}' | sort -u
 If that second command prints only `sm_52`, you have a build from before the
 portable-arch fix, and it will fault on the first kernel dispatch. See
 [PR #1](https://github.com/michauMiau/colibri-cuda-build/pull/1).
+
+To confirm the bundled runtime is wired up rather than just present:
+
+```bash
+# must print $ORIGIN/lib
+readelf -d qwen38 | grep RUNPATH
+
+# must not error
+./qwen38 --help
+
+# and it must stop working if you take the library away, otherwise the
+# binary was reading some other copy and the bundle is not what runs it
+mv lib/libcudart.so.12 /tmp/ && ./qwen38 --help; mv /tmp/libcudart.so.12 lib/
+```
+
+That last command is expected to fail with `cannot open shared object file`.
+If it succeeds, the binary is picking up a system CUDA you did not intend to
+depend on.
 
 ## Build it yourself
 
