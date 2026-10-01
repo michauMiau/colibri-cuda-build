@@ -139,8 +139,18 @@ jobs:
               export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
               ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-              CUDA=1 make -C c qwen38
-              
+              # CUDA_ARCH=portable is mandatory here, not an optimisation. The
+              # runner has no GPU, so nvcc cannot resolve -arch=native and
+              # silently falls back to a single default arch -- the shipped
+              # binary then dies at first kernel dispatch on any card that is
+              # not that default. 'portable' emits SASS for sm_80/86/89/90/120
+              # plus a compute_120 PTX fallback (sm_121 joins when nvcc >= 12.9).
+              # See the CUDA target selection block in c/Makefile.
+              # -o pipefail BEFORE the pipe: set after it, the flag never
+              # applies to the pipeline and a failed `make` exits 0 via tee.
+              set -o pipefail
+              CUDA=1 CUDA_ARCH=portable make -C c qwen38 2>&1 | tee /tmp/build.log
+
               #echo '=== Building with Ninja (parallel: all cores) ==='
               #make --build build --config Release -j\$(nproc)
               
@@ -167,6 +177,26 @@ jobs:
               # Strip binaries to reduce size (executables only, not .so files)
               #find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
+              echo '=== Staging the CUDA runtime for the bundling step ==='
+              # qwen38 links libcudart.so.12 and ships with an absolute RUNPATH
+              # of /usr/local/cuda/lib64, so it dies on any host without the
+              # toolkit. Rewriting that RUNPATH happens in a later step, outside
+              # this quoted argument: a literal $ORIGIN written here would be
+              # eaten by the runner's shell, and escaping it turns $ORIGIN into
+              # the string "\$ORIGIN", which the loader does not understand.
+              #
+              # The toolkit only exists inside this container and is gone by
+              # the time a later step runs, so stage the runtime where the
+              # runner can reach it.
+              mkdir -p /workspace/cuda-runtime
+              cp -L /usr/local/cuda/lib64/libcudart.so.12.* \
+                    /workspace/cuda-runtime/libcudart.so.12
+              chmod 0755 /workspace/cuda-runtime/libcudart.so.12
+              # The versioned soname, not the libcudart.so.12 symlink: that
+              # symlink is a toolchain artifact and would dangle for anyone who
+              # extracts the tarball without the toolkit.
+              ls -l /workspace/cuda-runtime/
+
               echo '=== Creating version info ==='
               echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
@@ -189,6 +219,135 @@ jobs:
           
           echo "=== Final disk usage ==="
           df -h
+
+      - name: Bundle the CUDA runtime
+        # Separate from the container step on purpose. That step's body is one
+        # double-quoted argument to bash -c, so the runner's shell expands every
+        # $VAR and $( ) before the container sees it, and an escaped dollar
+        # survives as a literal backslash instead. Two runs went red on exactly
+        # that: 36792216381 (cd with an emptied argument) and 36793568938
+        # (syntax error on the escaped form). Here ordinary shell quoting works.
+        run: |
+          set -euo pipefail
+          # patchelf rewrites the engine's RUNPATH below. It is not preinstalled
+          # on ubuntu-latest, and the rewrite is the whole reason the tarball
+          # works without a system CUDA, so install it explicitly rather than
+          # discovering the failure as a mysterious 127 later.
+          if ! command -v patchelf >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq patchelf
+          fi
+          patchelf --version
+
+          OUT="binaries/cuda-${{ matrix.cuda_version_short }}"
+          RUNTIME=cuda-runtime/libcudart.so.12
+          if [ ! -f "$RUNTIME" ]; then
+            echo "!!! $RUNTIME not staged by the container step" >&2
+            exit 1
+          fi
+          mkdir -p "$OUT/lib"
+          install -m 0755 "$RUNTIME" "$OUT/lib/libcudart.so.12"
+          echo "bundled $(du -h "$OUT/lib/libcudart.so.12" | cut -f1)"
+
+          # Rewrite the engine's RUNPATH so the bundle beside it is found.
+          #
+          # qwen38 ships with RUNPATH=/usr/local/cuda/lib64, an absolute path
+          # that only exists on a machine with the toolkit. patchelf points it
+          # at $ORIGIN/lib instead, and the loader expands $ORIGIN to the
+          # directory holding the executable. Result: ./qwen38 works with the
+          # CUDA runtime in ./lib, no wrapper, no LD_LIBRARY_PATH, no CUDA_HOME.
+          #
+          # Measured on a host with no CUDA installed at all: the bare binary
+          # exits 127 with "error while loading shared libraries: libcudart"
+          # before the rewrite, exits 1 (its own argument check) after, and
+          # goes back to 127 when lib/libcudart.so.12 is renamed away. The
+          # bundle is what makes it run, not the environment.
+          #
+          # Only qwen38 is patched. coli is a Python launcher, not an ELF, and
+          # it detects CUDA with ldd on the engine it starts, so it picks up
+          # the patched binary on its own. Running patchelf on it would abort
+          # the step with "not an ELF executable".
+          for tool in qwen38; do
+            patchelf --set-rpath '$ORIGIN/lib' "$OUT/$tool"
+          done
+
+          # Verify rather than trust: $ORIGIN has to survive as a literal, and
+          # the absolute path has to be gone, or the loader would keep
+          # preferring it and never look in lib/.
+          if ! readelf -d "$OUT/qwen38" | grep -Fq '$ORIGIN/lib'; then
+            echo "!!! qwen38 RUNPATH was not rewritten" >&2
+            readelf -d "$OUT/qwen38" | grep -E 'RPATH|RUNPATH' >&2
+            exit 1
+          fi
+          if readelf -d "$OUT/qwen38" | grep -Fq '/usr/local/cuda'; then
+            echo "!!! qwen38 still carries the absolute CUDA path" >&2
+            exit 1
+          fi
+          echo 'RUNPATH is now $ORIGIN/lib on qwen38'
+
+          # The wrapper stays as a fallback for anyone who copies the binary
+          # out of the tarball layout, where $ORIGIN/lib no longer points at
+          # the bundle. It also sets CUDA_HOME, which is what colibri's own
+          # CUDA_HOME lookup reads.
+          sed 's/BINARY_NAME/qwen38/' scripts/run-with-bundled-cuda.sh > "$OUT/qwen38.run"
+          sed 's/BINARY_NAME/coli/'   scripts/run-with-bundled-cuda.sh > "$OUT/coli.run"
+          chmod 0755 "$OUT/qwen38.run" "$OUT/coli.run"
+
+          # Prove both paths before shipping, with LD_LIBRARY_PATH cleared so
+          # nothing on the runner can stand in for the bundle.
+          #
+          # `&&/||` rather than `; rc=$?`: this step runs under `set -e`, so a
+          # bare ./qwen38 exiting non-zero kills the step before the code is
+          # ever recorded. Run 36795504752 failed exactly there.
+          #
+          # Both 126 and 127 are fatal, and they are different bugs:
+          #   127  the loader could not open libcudart -> the bundle is ignored
+          #   126  the file is not executable -> the tarball ships a dead file
+          # Checking only for 127 would let a 126 pass as "it started".
+          ( cd "$OUT"
+            unset LD_LIBRARY_PATH
+            ./qwen38     --help >/dev/null 2>&1 && bare=0 || bare=$?
+            ./qwen38.run --help >/dev/null 2>&1 && wrapped=0 || wrapped=$?
+            ./coli.run   --help >/dev/null 2>&1 || true
+            echo "bare qwen38 exit:   $bare"
+            echo "wrapper exit:       $wrapped"
+            for code in "$bare" "$wrapped"; do
+              case "$code" in
+                126) echo "!!! a shipped file is not executable" >&2; exit 1 ;;
+                127) echo "!!! the loader could not open libcudart" >&2; exit 1 ;;
+              esac
+            done )
+          ls -lh "$OUT/" "$OUT/lib/"
+
+      - name: Verify the CUDA artifact is not a single-arch stub
+        # Deliberately a separate step, not a block inside the bash -c above.
+        # That body is one double-quoted argument, so a $(...) inside it is
+        # not escaped for the runner's shell and blows up with "syntax error
+        # near unexpected token '('". Verified by running this workflow.
+        #
+        # A build with no GPU and no CUDA_ARCH=portable produces a fatbin
+        # carrying a single default arch (sm_52 on CUDA 12.x, below this
+        # project's sm_75 floor). It still ships a .nv_fatbin section and links
+        # libcudart, so presence and size checks both pass -- and the binary
+        # then dies at first kernel dispatch on every real card.
+        run: |
+          set -euo pipefail
+          FAT="binaries/cuda-${{ matrix.cuda_version_short }}/backend_cuda.o"
+          if [ ! -f "$FAT" ]; then
+            echo "!!! $FAT missing -- nvcc never ran" >&2
+            exit 1
+          fi
+          SM_COUNT=$(strings "$FAT" | grep -oE 'sm_[0-9]{2}' | sort -u | tr '\n' ' ')
+          echo "archs in fatbin: ${SM_COUNT:-none-labelled}"
+          if printf '%s' "$SM_COUNT" | grep -qE 'sm_5[23]'; then
+            echo "!!! default/fallback arch (sm_5x) present -- CUDA_ARCH was not portable" >&2
+            exit 1
+          fi
+          ls -lh "$FAT" binaries/cuda-${{ matrix.cuda_version_short }}/
+
+      - name: Clean up the staged runtime
+        if: always()
+        run: rm -rf cuda-runtime
 
       - name: Create tarball
         run: |
@@ -229,26 +388,21 @@ jobs:
           find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
-#      - name: Create advancing release tag
-       #
-        # GitHub sorts the /releases list by each release's created_at, which is
-        # the *committer date of the tag's target commit* — not the publish
-        # time. Previously softprops/action-gh-release created every tag at the
-        # static main HEAD (unchanged since May 2026), so every release reported
-        # the same created_at and the /releases list stopped reflecting recency:
-        # API consumers polling the first page never saw newer builds. Anchor
-        # each tag to a fresh empty commit whose committer date is build time so
-        # created_at advances and new releases sort to the top of the list.
-        # The commit is reachable only via its tag; main is never pushed.
-   #     run: |
-    #      set -euo pipefail
-     #     TAG="${{ needs.check-release.outputs.release_tag }}"
-      #    git config user.name  "github-actions[bot]"
-        #  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-         # git commit --allow-empty \
-          #  -m "Colibri ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
-         # git tag "${TAG}"
-         # git push origin "refs/tags/${TAG}"
+      - name: Move the release tag forward
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-release.outputs.release_tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Colibri ${TAG} CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # -f and --force are required, not optional. softprops/action-gh-release
+          # has already created this tag at the static main HEAD by the time we
+          # get here, so a plain `git tag` dies with "already exists". The tag
+          # is a build marker for this repo alone -- the real v1.12.1 lives in
+          # JustVugg/colibri -- so moving it forward is what makes the point.
+          git tag -f "${TAG}"
+          git push --force origin "refs/tags/${TAG}"
+          echo "tag ${TAG} now points at $(git rev-parse --short HEAD)"
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -256,39 +410,51 @@ jobs:
           tag_name: ${{ needs.check-release.outputs.release_tag }}
           name: colibri ${{ needs.check-release.outputs.release_tag }} with CUDA
           body: |
-            # colibri ${{ needs.check-release.outputs.release_tag }} with CUDA Support
-            
-            Pre-built binaries of colibri with CUDA support for multiple CUDA versions.
-            
-            **Source:** https://github.com/ggml-org/colibri/releases/tag/${{ needs.check-release.outputs.release_tag }}
-            **Commit:** ${{ needs.check-release.outputs.release_hash }}
-            
-            ## CUDA Versions
-            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
+            colibri ${{ needs.check-release.outputs.release_tag }} with CUDA
 
-            ## Host architectures
-            Tarballs are published per host CPU architecture (Linux):
-            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
-            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
+            Prebuilt `qwen38` and `coli` from JustVugg/colibri, compiled for CUDA 12.8.
 
-            ## GPU compute capability reference
-            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
-            - 8.0: A100
-            - 8.6: RTX 3000 series
-            - 8.9: RTX 4000 series, L4, L40
-            - 9.0: H100, H200, GH200
-            - 10.0: B200, GB200
-            - 12.0: RTX Pro series, RTX 50xx
+            **Source:** https://github.com/JustVugg/colibri/releases/tag/${{ needs.check-release.outputs.release_tag }}
+            **Build commit:** ${{ needs.check-release.outputs.release_hash }}
+
+            ## GPU support
+
+            SASS for compute capability 8.0, 8.6, 8.9, 9.0 and 12.0, plus a compute_120 PTX payload so cards newer than that JIT on first run.
+
+            | Compute capability | Cards |
+            |---|---|
+            | 8.0 | A100 |
+            | 8.6 | RTX 3000 series |
+            | 8.9 | RTX 4000 series, L4, L40 |
+            | 9.0 | H100, H200, GH200 |
+            | 12.0 | RTX 5000 series, RTX Pro |
+
+            Turing (7.5) and Blackwell datacenter (10.0) are not built. Colibri's portable list starts at sm_80 and does not carry sm_100.
+
+            Needs NVIDIA driver 570.15 or newer.
+
+            ## Host architecture
+
+            x86-64 only. There is no arm64 tarball.
 
             ## Usage
-            Download the tarball matching your host CPU arch and CUDA version, then extract:
+
             ```bash
-            # amd64 host
             tar -xzf colibri-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
-            # arm64 host (e.g. Grace Blackwell)
-            tar -xzf colibri-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
+            cd cuda-12.8
+            ./qwen38 --help
             ./coli info
             ```
+
+            ## Check what you downloaded
+
+            ```bash
+            strings backend_cuda.o | grep -oE 'sm_[0-9]{2}' | sort -u
+            ```
+
+            Expect 80, 86, 89, 90, 120. A lone `sm_52` means a build from before the portable-arch fix, and it faults on the first kernel dispatch.
+
+            The binaries link statically, so there is no shared library to install. `libcudart.so.12` comes from the CUDA 12.8 runtime and has to be on the loader path.
           files: release-assets/*
           draft: false
           prerelease: false
