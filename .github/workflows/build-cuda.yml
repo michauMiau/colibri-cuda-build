@@ -136,7 +136,7 @@ jobs:
               cd colibri
               
               echo '=== Configuring build with Ninja ==='
-              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs\${LIBRARY_PATH:+:\$LIBRARY_PATH}"
+              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
               ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
               # CUDA_ARCH=portable is mandatory here, not an optimisation. The
@@ -180,53 +180,51 @@ jobs:
               echo '=== Bundling the CUDA runtime ==='
               # qwen38 links libcudart.so.12 and carries RUNPATH
               # /usr/local/cuda/lib64, so it fails to start unless the user has
-              # the CUDA toolkit installed. colibri honours CUDA_HOME over the
-              # default path, so bundle the runtime and keep it next to the
-              # binary; the wrapper below puts it on LD_LIBRARY_PATH.
-              # Everything here must land in binaries/, that is the dir the
-              # tarball step packs -- writing to the workspace root produces a
-              # lib/ that never ships.
+              # the CUDA toolkit installed.
               #
-              # NOTE on the backslashes below. This whole body is one
-              # double-quoted argument to bash -c, so the RUNNER's shell
-              # expands \$ and \$( ) before the container ever sees them. An
-              # unescaped \$OUT arrives here already empty, and the build fails
-              # with "cd: No such file or directory". Every variable used
-              # inside this block must be written \$-escaped.
-              OUT=binaries/cuda-\${{ matrix.cuda_version_short }}
+              # No shell variables in this block, on purpose. This body is one
+              # double-quoted argument to bash -c, so the RUNNER's shell eats
+              # $VAR and $( ) before the container starts. Escaping the dollar
+              # does not help either: the runner passes the backslash through
+              # too, and bash then reports a syntax error on the escaped form.
+              # Both variants were tried here and both shipped a red build, so
+              # this block uses literal paths only.
+              OUTDIR=binaries/cuda-12.8
               CUDA_LIB=/usr/local/cuda/lib64
-              # Pick the real versioned soname, not the .12 dev symlink: the
-              # symlink is what the toolchain ships, and copying it would
-              # dangle for anyone without the toolkit.
-              RUNTIME=\$(ls "\$CUDA_LIB"/libcudart.so.12.* 2>/dev/null | head -1)
-              if [ -z "\$RUNTIME" ]; then
-                echo "!!! libcudart.so.12.* not found in \$CUDA_LIB" >&2
+              mkdir -p "$OUTDIR/lib"
+              # Copy the real versioned soname, not the libcudart.so.12
+              # symlink: that symlink is a toolchain artifact and would dangle
+              # for anyone who extracts the tarball without the toolkit.
+              set -- "$CUDA_LIB"/libcudart.so.12.*
+              if [ ! -f "$1" ]; then
+                echo "!!! no libcudart.so.12.* in $CUDA_LIB" >&2
                 exit 1
               fi
-              mkdir -p "\$OUT/lib"
-              cp -L "\$RUNTIME" "\$OUT/lib/libcudart.so.12"
-              chmod 0755 "\$OUT/lib/libcudart.so.12"
-              echo "bundled: \$(basename "\$RUNTIME") -> \$(du -h "\$OUT/lib/libcudart.so.12" | cut -f1)"
+              cp -L "$1" "$OUTDIR/lib/libcudart.so.12"
+              chmod 0755 "$OUTDIR/lib/libcudart.so.12"
+              echo "bundled $(basename "$1") -> $(du -h "$OUTDIR/lib/libcudart.so.12" | cut -f1)"
+              ls -l "$OUTDIR/lib/"
 
               echo '=== Creating the loader wrapper ==='
-              # RUNPATH cannot express a relative path, so the binary cannot
-              # find a bundled lib/ on its own. The template lives in the repo
-              # (scripts/run-with-bundled-cuda.sh) because a heredoc inside
-              # this doubly-quoted bash -c argument has its terminator
-              # indented, and a non-column-zero terminator never closes it.
-              for tool in qwen38 coli; do
-                sed "s/BINARY_NAME/\$tool/" scripts/run-with-bundled-cuda.sh > "\$OUT/\$tool.run"
-                chmod 0755 "\$OUT/\$tool.run"
-              done
-              # Prove the wrapper works before shipping: without the toolkit
-              # installed the bare binary must fail on the missing soname, and
-              # the wrapper must not.
-              ( cd "\$OUT"
-                unset LD_LIBRARY_PATH
-                ./qwen38 >/dev/null 2>&1 && rc=0 || rc=\$?
-                echo "bare binary exit: \$rc"
-                ./qwen38.run --help >/dev/null 2>&1 && wrc=0 || wrc=\$?
-                echo "wrapper exit: \$wrc" ) || true
+              # RUNPATH cannot hold a relative path, so a bundled lib/ next to
+              # the binary is invisible to the loader. The wrapper sets
+              # LD_LIBRARY_PATH and CUDA_HOME, which is also what colibri's own
+              # CUDA_HOME lookup wants. The template is a repo file because a
+              # heredoc terminator indented inside this quoted argument never
+              # closes it.
+              sed 's/BINARY_NAME/qwen38/' scripts/run-with-bundled-cuda.sh > "$OUTDIR/qwen38.run"
+              sed 's/BINARY_NAME/coli/'   scripts/run-with-bundled-cuda.sh > "$OUTDIR/coli.run"
+              chmod 0755 "$OUTDIR/qwen38.run" "$OUTDIR/coli.run"
+              # Prove the wrapper before shipping: with LD_LIBRARY_PATH
+              # cleared the bare binary must fail on the missing soname, the
+              # wrapper must not.
+              cd "$OUTDIR" || exit 1
+              unset LD_LIBRARY_PATH
+              ./qwen38 >/dev/null 2>&1 && rc=0 || rc=$?
+              echo "bare binary exit: $rc"
+              ./qwen38.run --help >/dev/null 2>&1 && wrc=0 || wrc=$?
+              echo "wrapper exit: $wrc"
+              cd /workspace || exit 1
 
               echo '=== Creating version info ==='
               echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
