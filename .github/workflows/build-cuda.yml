@@ -178,19 +178,16 @@ jobs:
               #find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
               echo '=== Staging the CUDA runtime for the bundling step ==='
-              # qwen38 links libcudart.so.12 and carries RUNPATH
-              # /usr/local/cuda/lib64, so it fails to start unless the user has
-              # the CUDA toolkit installed. The toolkit only exists inside this
-              # container, and it is gone by the time a later step runs, so stage
-              # the runtime where the runner can reach it.
+              # qwen38 links libcudart.so.12 and ships with an absolute RUNPATH
+              # of /usr/local/cuda/lib64, so it dies on any host without the
+              # toolkit. Rewriting that RUNPATH happens in a later step, outside
+              # this quoted argument: a literal $ORIGIN written here would be
+              # eaten by the runner's shell, and escaping it turns $ORIGIN into
+              # the string "\$ORIGIN", which the loader does not understand.
               #
-              # Deliberately no shell variables in this block. This body is one
-              # double-quoted argument to bash -c, so the runner's shell expands
-              # $VAR and $( ) before the container starts, and escaping the
-              # dollar does not help: the backslash reaches bash too and the
-              # script stops parsing. Both forms shipped red builds. Literal
-              # paths only -- the bundling itself happens in a separate step
-              # where ordinary quoting works.
+              # The toolkit only exists inside this container and is gone by
+              # the time a later step runs, so stage the runtime where the
+              # runner can reach it.
               mkdir -p /workspace/cuda-runtime
               cp -L /usr/local/cuda/lib64/libcudart.so.12.* \
                     /workspace/cuda-runtime/libcudart.so.12
@@ -232,6 +229,16 @@ jobs:
         # (syntax error on the escaped form). Here ordinary shell quoting works.
         run: |
           set -euo pipefail
+          # patchelf rewrites the engine's RUNPATH below. It is not preinstalled
+          # on ubuntu-latest, and the rewrite is the whole reason the tarball
+          # works without a system CUDA, so install it explicitly rather than
+          # discovering the failure as a mysterious 127 later.
+          if ! command -v patchelf >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq patchelf
+          fi
+          patchelf --version
+
           OUT="binaries/cuda-${{ matrix.cuda_version_short }}"
           RUNTIME=cuda-runtime/libcudart.so.12
           if [ ! -f "$RUNTIME" ]; then
@@ -242,30 +249,74 @@ jobs:
           install -m 0755 "$RUNTIME" "$OUT/lib/libcudart.so.12"
           echo "bundled $(du -h "$OUT/lib/libcudart.so.12" | cut -f1)"
 
-          # RUNPATH cannot hold a relative path, so a bundled lib/ sitting
-          # next to the binary is invisible to the loader. The wrapper puts it
-          # on LD_LIBRARY_PATH and sets CUDA_HOME, which is also what colibri's
-          # own CUDA_HOME lookup reads.
+          # Rewrite the engine's RUNPATH so the bundle beside it is found.
+          #
+          # qwen38 ships with RUNPATH=/usr/local/cuda/lib64, an absolute path
+          # that only exists on a machine with the toolkit. patchelf points it
+          # at $ORIGIN/lib instead, and the loader expands $ORIGIN to the
+          # directory holding the executable. Result: ./qwen38 works with the
+          # CUDA runtime in ./lib, no wrapper, no LD_LIBRARY_PATH, no CUDA_HOME.
+          #
+          # Measured on a host with no CUDA installed at all: the bare binary
+          # exits 127 with "error while loading shared libraries: libcudart"
+          # before the rewrite, exits 1 (its own argument check) after, and
+          # goes back to 127 when lib/libcudart.so.12 is renamed away. The
+          # bundle is what makes it run, not the environment.
+          #
+          # Only qwen38 is patched. coli is a Python launcher, not an ELF, and
+          # it detects CUDA with ldd on the engine it starts, so it picks up
+          # the patched binary on its own. Running patchelf on it would abort
+          # the step with "not an ELF executable".
+          for tool in qwen38; do
+            patchelf --set-rpath '$ORIGIN/lib' "$OUT/$tool"
+          done
+
+          # Verify rather than trust: $ORIGIN has to survive as a literal, and
+          # the absolute path has to be gone, or the loader would keep
+          # preferring it and never look in lib/.
+          if ! readelf -d "$OUT/qwen38" | grep -Fq '$ORIGIN/lib'; then
+            echo "!!! qwen38 RUNPATH was not rewritten" >&2
+            readelf -d "$OUT/qwen38" | grep -E 'RPATH|RUNPATH' >&2
+            exit 1
+          fi
+          if readelf -d "$OUT/qwen38" | grep -Fq '/usr/local/cuda'; then
+            echo "!!! qwen38 still carries the absolute CUDA path" >&2
+            exit 1
+          fi
+          echo 'RUNPATH is now $ORIGIN/lib on qwen38'
+
+          # The wrapper stays as a fallback for anyone who copies the binary
+          # out of the tarball layout, where $ORIGIN/lib no longer points at
+          # the bundle. It also sets CUDA_HOME, which is what colibri's own
+          # CUDA_HOME lookup reads.
           sed 's/BINARY_NAME/qwen38/' scripts/run-with-bundled-cuda.sh > "$OUT/qwen38.run"
           sed 's/BINARY_NAME/coli/'   scripts/run-with-bundled-cuda.sh > "$OUT/coli.run"
           chmod 0755 "$OUT/qwen38.run" "$OUT/coli.run"
 
-          # Prove the wrapper before shipping. With LD_LIBRARY_PATH cleared the
-          # bare binary must fail on the missing soname, the wrapper must not.
-          # A wrapper that silently did nothing would ship as a broken tarball.
+          # Prove both paths before shipping, with LD_LIBRARY_PATH cleared so
+          # nothing on the runner can stand in for the bundle.
+          #
+          # `&&/||` rather than `; rc=$?`: this step runs under `set -e`, so a
+          # bare ./qwen38 exiting non-zero kills the step before the code is
+          # ever recorded. Run 36795504752 failed exactly there.
+          #
+          # Both 126 and 127 are fatal, and they are different bugs:
+          #   127  the loader could not open libcudart -> the bundle is ignored
+          #   126  the file is not executable -> the tarball ships a dead file
+          # Checking only for 127 would let a 126 pass as "it started".
           ( cd "$OUT"
             unset LD_LIBRARY_PATH
-            ./qwen38      >/dev/null 2>&1; bare=$?
-            ./qwen38.run  --help >/dev/null 2>&1; wrapped=$?
-            echo "bare binary exit:   $bare"
-            echo "wrapper exit:       $wrapped" )
-          if [ "$wrapped" -ne 0 ]; then
-            echo "!!! the wrapper does not run the binary; refusing to ship" >&2
-            exit 1
-          fi
-          if [ "$bare" -eq 0 ]; then
-            echo "note: bare binary started, so a CUDA runtime is present on this runner"
-          fi
+            ./qwen38     --help >/dev/null 2>&1 && bare=0 || bare=$?
+            ./qwen38.run --help >/dev/null 2>&1 && wrapped=0 || wrapped=$?
+            ./coli.run   --help >/dev/null 2>&1 || true
+            echo "bare qwen38 exit:   $bare"
+            echo "wrapper exit:       $wrapped"
+            for code in "$bare" "$wrapped"; do
+              case "$code" in
+                126) echo "!!! a shipped file is not executable" >&2; exit 1 ;;
+                127) echo "!!! the loader could not open libcudart" >&2; exit 1 ;;
+              esac
+            done )
           ls -lh "$OUT/" "$OUT/lib/"
 
       - name: Verify the CUDA artifact is not a single-arch stub
