@@ -363,9 +363,14 @@ jobs:
           echo "--- workspace as the runner sees it ---"
           ls -la .
           echo "--- cuda-runtime ---"
-          ls -la cuda-runtime 2>&1
+          # ls of a missing directory returns 2 and this step runs under -e, so
+          # the probe aborted the step before it could print the diagnostic the
+          # probe existed to collect. || true keeps the listing, drops the code.
+          ls -la cuda-runtime 2>&1 || true
+          echo "--- container's own view ---"
+          cat _container-diag.txt 2>&1 || echo "  (container wrote no diagnostic)"
           echo "--- $OUT ---"
-          ls -la "$OUT" 2>&1
+          ls -la "$OUT" 2>&1 || true
           echo "--------------------------------"
           RUNTIME=cuda-runtime/libcudart.so.12
           if [ ! -f "$RUNTIME" ]; then
