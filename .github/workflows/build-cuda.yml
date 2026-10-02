@@ -188,32 +188,23 @@ jobs:
               cat /workspace/.colibri-commit
               
               echo '=== Configuring build with Ninja ==='
-              # Prove the search path instead of assuming it. The soname symlink
-              # this used to create is not in the 12.8.1 image, and `ln -sf` does
-              # not create the containing directory, so run 36989594064 died with
-              #   ln: failed to create symbolic link .../libcuda.so.1:
-              #       No such file or directory
-              # and the mkdir added as a fix hit
-              #   mkdir: cannot create directory '/usr/local/cuda': Permission denied
-              # because the container does not run as root. So the directory is
-              # not created and the symlink is not made; what has to be checked
-              # instead is whether libcuda is resolvable without them.
-              echo "--- cuda tree as the container sees it ---"
-              ls -ld /usr/local/cuda 2>&1
-              ls -l /usr/local/cuda/lib64 2>&1 | head -20
-              echo "--- stubs ---"
-              ls -l /usr/local/cuda/lib64/stubs 2>&1
-              echo "--- is libcuda resolvable at all? ---"
-              ldconfig -p 2>/dev/null | grep -c libcuda || echo "0"
-              # CUDA_ARCH=portable is mandatory here, not an optimisation. The
-              # runner has no GPU, so nvcc cannot resolve -arch=native and
-              # silently falls back to a single default arch -- the shipped
-              # binary then dies at first kernel dispatch on any card that is
-              # not that default. 'portable' emits SASS for sm_80/86/89/90/120
-              # plus a compute_120 PTX fallback (sm_121 joins when nvcc >= 12.9).
-              # See the CUDA target selection block in c/Makefile.
+              # No listing of the CUDA tree here. `ls -l ... | head -20` looks
+              # harmless but head closes the pipe, ls dies on SIGPIPE with 141,
+              # and pipefail plus set -e turn that into a dead container. That is
+              # what killed run 36998175818: the build step reported success,
+              # the compiler never ran, and the bundling step then found no
+              # binaries/ and no cuda-runtime/. Verified:
+              #   $ bash -c 'set -e; set -o pipefail; ls -l /usr/bin | head -3'
+              #   exit=141
+              # CUDA_ARCH=portable is mandatory, not an optimisation. The runner has no GPU,
+              # so nvcc cannot resolve -arch=native and falls back to a single
+              # default arch, and the shipped binary then dies at first kernel
+              # dispatch on any card that is not that default. 'portable' emits
+              # SASS for sm_80/86/89/90/120 plus a compute_120 PTX fallback
+              # (sm_121 joins when nvcc >= 12.9). See the target selection block
+              # in c/Makefile.
               # -o pipefail BEFORE the pipe: set after it, the flag never
-              # applies to the pipeline and a failed `make` exits 0 via tee.
+              # applies to the pipeline and a failed make exits 0 via tee.
               set -o pipefail
               CUDA=1 CUDA_ARCH=portable make -C c qwen38 2>&1 | tee /tmp/build.log
 
