@@ -159,10 +159,21 @@ jobs:
               set -e
               
               echo '=== Installing minimal dependencies ==='
+              # Trace from the very first line, before anything can fail, and
+              # without a substitution. Runs 36994417357 through 37000213757 all
+              # stopped somewhere in here, and the log only ever shows the start:
+              # the newest one ends mid "Reading database" in the middle of
+              # apt-get install, which is where the log download cuts off rather
+              # than where the container died. Reading it further cannot say more.
+              echo "0 container start" > /workspace/_trace.txt
+              pwd >> /workspace/_trace.txt
               apt-get update -qq
+              echo "1 after apt-get update" >> /workspace/_trace.txt
               apt-get install -y --no-install-recommends git make build-essential libssl-dev ca-certificates
+              echo "2 after apt-get install" >> /workspace/_trace.txt
               apt-get clean
               rm -rf /var/lib/apt/lists/*
+              echo "3 after cleanup" >> /workspace/_trace.txt
               
               echo '=== Cloning Colibri ==='
               cd /workspace
@@ -338,7 +349,9 @@ jobs:
           # the mount instead. Print it before deciding anything, so a failure
           # names the line it stopped on.
           echo "--- container trace ---"
-          cat _trace.txt 2>&1 || echo "  (no trace: the container died before the first line)"
+          cat _trace.txt 2>&1 || echo "  (no trace at all: the container wrote nothing)"
+          echo "--- binaries ---"
+          ls -la "$OUT" 2>&1 || true
           echo "------------------------"
           RUNTIME=cuda-runtime/libcudart.so.12
           if [ ! -f "$RUNTIME" ]; then
