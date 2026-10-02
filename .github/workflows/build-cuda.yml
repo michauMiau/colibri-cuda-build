@@ -244,16 +244,20 @@ jobs:
               #find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
               echo '=== Staging the CUDA runtime for the bundling step ==='
-              # qwen38 links libcudart.so.12 and ships with an absolute RUNPATH
-              # of /usr/local/cuda/lib64, so it dies on any host without the
-              # toolkit. Rewriting that RUNPATH happens in a later step, outside
-              # this quoted argument: the origin token written literally here
-              # would be eaten by the runner's shell, and escaping it leaves a
-              # backslash in the string, which the loader does not understand.
+              # Assert the staging HERE, inside the container, where the source
+              # and the destination can both be seen. The bundling step found
+              # cuda-runtime/libcudart.so.12 missing and could only report
+              # that, with no way to say whether the copy never ran, ran against
+              # a glob that matched nothing, or ran and something removed it.
               #
-              # The toolkit only exists inside this container and is gone by
-              # the time a later step runs, so stage the runtime where the
-              # runner can reach it.
+              # Run 36994417357 built successfully and then failed two steps
+              # later on exactly this, and the log did not contain the
+              # container's stdout at all, so there was nothing to read. Each
+              # check below names the thing it rules out.
+              echo "  glob result:"
+              ls -l /usr/local/cuda/lib64/libcudart.so.12.* 2>&1
+              echo "  staging dir before copy:"
+              ls -ld /workspace/cuda-runtime 2>&1
               mkdir -p /workspace/cuda-runtime
               cp -L /usr/local/cuda/lib64/libcudart.so.12.* \
                     /workspace/cuda-runtime/libcudart.so.12
@@ -262,6 +266,21 @@ jobs:
               # symlink is a toolchain artifact and would dangle for anyone who
               # extracts the tarball without the toolkit.
               ls -l /workspace/cuda-runtime/
+              # Prove the copy landed and is a real library, not an empty file
+              # from a failed cp. Both failures reported above would pass a
+              # bare -f test, so the size is compared against the source.
+              echo "  source size:"
+              stat -c %s /usr/local/cuda/lib64/libcudart.so.12.* 2>&1
+              echo "  staged size:"
+              stat -c %s /workspace/cuda-runtime/libcudart.so.12
+              if [ ! -s /workspace/cuda-runtime/libcudart.so.12 ]; then
+                echo "!!! staging produced an empty or missing file" >&2
+                exit 1
+              fi
+              # Confirms it is an ELF shared object, so a bad copy is caught
+              # here rather than by a loader error on a user machine.
+              file /workspace/cuda-runtime/libcudart.so.12 2>&1 || true
+              echo "=== Staging verified ==="
 
               echo '=== Creating version info ==='
               # No the date here. It would be expanded by the runner rather than
