@@ -30,15 +30,49 @@ jobs:
         run: |
           # Get latest release from colibri
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.tag_name')
-          RELEASE_HASH=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.target_commitish')
           
           echo "Latest colibri release: $LATEST_RELEASE"
-          echo "Release hash: $RELEASE_HASH"
+          
+          # Resolve the tag to a commit.
+          #
+          # `.target_commitish` is the branch the release was published from, not
+          # a commit. For v1.12.1 it reads "main", so it names a moving ref:
+          # every rebuild compares a different value and the provenance check
+          # records nothing reproducible.
+          #
+          # The tag ref is an annotated tag object, so one dereference lands on
+          # another tag and a second lands on the commit. Without the second one
+          # RELEASE_HASH is the tag object's sha, which is also not the commit.
+          # curl -s without -f returns 0 on a 404 and hands an error page to jq,
+          # so -sf is load-bearing: without it a missing tag yields null here and
+          # the failure surfaces later as a confusing clone error.
+          REF=$(curl -sf "https://api.github.com/repos/JustVugg/colibri/git/ref/tags/${LATEST_RELEASE}" | jq -r .object.sha)
+          TYPE=$(curl -sf "https://api.github.com/repos/JustVugg/colibri/git/ref/tags/${LATEST_RELEASE}" | jq -r .object.type)
+          if [ "$TYPE" = "tag" ]; then
+            REF=$(curl -sf "https://api.github.com/repos/JustVugg/colibri/git/tags/${REF}" | jq -r .object.sha)
+          fi
+          RELEASE_HASH="$REF"
+          
+          # An empty or unresolved value must stop here. Downstream it would be
+          # interpolated into a clone and into the release body, and "null"
+          # passes a non-empty test, so the failure would appear as a bad build
+          # rather than as a bad lookup.
+          if [ -z "$RELEASE_HASH" ] || [ "$RELEASE_HASH" = "null" ]; then
+            echo "!!! could not resolve a commit for ${LATEST_RELEASE}" >&2
+            exit 1
+          fi
+          
+          echo "Release commit: $RELEASE_HASH"
           
           # Check if we've already built this release
           if git tag | grep -q "^${LATEST_RELEASE}$"; then
             echo "Release $LATEST_RELEASE already built"
-            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+            # inputs.force_build, not github.event.inputs.force_build.
+            # The latter is empty on the schedule event, which is half of this
+            # workflow's triggers, and it is empty for a boolean input on some
+            # dispatch versions too. Empty is not "false" to the comparison
+            # below, so the daily run silently took the other branch.
+            if [ "${{ inputs.force_build }}" = "true" ]; then
               echo "Force build enabled, building anyway"
               echo "should_build=true" >> $GITHUB_OUTPUT
             else
