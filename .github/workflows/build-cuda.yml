@@ -159,21 +159,37 @@ jobs:
               set -e
               
               echo '=== Installing minimal dependencies ==='
-              # Trace from the very first line, before anything can fail, and
-              # without a substitution. Runs 36994417357 through 37000213757 all
-              # stopped somewhere in here, and the log only ever shows the start:
-              # the newest one ends mid "Reading database" in the middle of
-              # apt-get install, which is where the log download cuts off rather
-              # than where the container died. Reading it further cannot say more.
-              echo "0 container start" > /workspace/_trace.txt
-              pwd >> /workspace/_trace.txt
-              apt-get update -qq
-              echo "1 after apt-get update" >> /workspace/_trace.txt
+              # The first thing written is not to the mount, because if the mount
+              # is the problem then writing to it is the thing that fails and
+              # says nothing. 37000605871 left no trace file at all while the
+              # workspace listing was clean, so the very first write died and
+              # the script had nothing to report. This one is to /tmp, inside
+              # the container, and the build step cats it whether or not the
+              # mount is usable.
+              echo "0 container start, cwd follows" > /tmp/trace.txt
+              pwd >> /tmp/trace.txt
+              ls -ld /workspace >> /tmp/trace.txt 2>&1
+              # touch proves the mount is writable; || true keeps set -e from
+              # ending the script here, which would hide the answer.
+              touch /workspace/_writable 2>&1 >> /tmp/trace.txt || echo "MOUNT NOT WRITABLE" >> /tmp/trace.txt
+              echo "1 workspace listing" >> /tmp/trace.txt
+              ls -la /workspace >> /tmp/trace.txt 2>&1
+              # The -qq that hid the error is removed. Runs 36994417357 through
+              # 37000605871 all stopped here or later, and this one is visible:
+              # the container printed its first marker and then nothing at all,
+              # no trace file, no clone, no package downloads, and exited zero.
+              # With -qq, "apt-get update" failing said nothing, so the log gave
+              # no clue and the run looked like a hang.
+              apt-get update
+              echo "1 after apt-get update" >> /tmp/trace.txt
+              echo "1 after apt-get update" >> /workspace/_trace.txt || true
               apt-get install -y --no-install-recommends git make build-essential libssl-dev ca-certificates
-              echo "2 after apt-get install" >> /workspace/_trace.txt
+              echo "2 after apt-get install" >> /tmp/trace.txt
+              echo "2 after apt-get install" >> /workspace/_trace.txt || true
               apt-get clean
               rm -rf /var/lib/apt/lists/*
-              echo "3 after cleanup" >> /workspace/_trace.txt
+              echo "3 after cleanup" >> /tmp/trace.txt
+              echo "3 after cleanup" >> /workspace/_trace.txt || true
               
               echo '=== Cloning Colibri ==='
               cd /workspace
@@ -191,10 +207,12 @@ jobs:
               pwd >> /workspace/_trace.txt
               git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/JustVugg/colibri.git || \
                 (git clone https://github.com/JustVugg/colibri.git && cd colibri && git checkout ${{ needs.check-release.outputs.release_hash }})
-              echo "2 clone returned" >> /workspace/_trace.txt
+              echo "2 clone returned" >> /tmp/trace.txt
+              echo "2 clone returned" >> /workspace/_trace.txt || true
               ls -d colibri >> /workspace/_trace.txt
               cd colibri
-              echo "3 cd colibri" >> /workspace/_trace.txt
+              echo "3 cd colibri" >> /tmp/trace.txt
+              echo "3 cd colibri" >> /workspace/_trace.txt || true
               pwd >> /workspace/_trace.txt
               # Every line here is built with `cat` and redirection, never with
               # a substitution. This block lives inside the one double-quoted
@@ -230,10 +248,11 @@ jobs:
               # -o pipefail BEFORE the pipe: set after it, the flag never
               # applies to the pipeline and a failed make exits 0 via tee.
               set -o pipefail
-              echo "4 before make" >> /workspace/_trace.txt
+              echo "4 before make" >> /tmp/trace.txt
+              echo "4 before make" >> /workspace/_trace.txt || true
               CUDA=1 CUDA_ARCH=portable make -C c qwen38 2>&1 | tee /tmp/build.log
-              echo "5 after make" >> /workspace/_trace.txt
-
+              echo "5 after make" >> /tmp/trace.txt
+              echo "5 after make" >> /workspace/_trace.txt || true
               #echo '=== Building with Ninja (parallel: all cores) ==='
               #make --build build --config Release -j\nproc
               
@@ -314,6 +333,13 @@ jobs:
               
               echo '=== Cleaning up build directory ==='
               rm -rf colibri
+              # Last thing the container does. /tmp/trace.txt is the full record
+              # and it only exists here, so it is copied to the mount before the
+              # container goes away. The earlier markers went to both places
+              # because if the mount is unusable neither this nor they can be
+              # trusted, and the build step prints whichever file it finds.
+              cp /tmp/trace.txt /workspace/_trace-final.txt 2>&1 || true
+              ls -la /tmp/trace.txt /workspace/_trace*.txt 2>&1 || true
             "
           
           # Remove Docker image to free space
@@ -348,8 +374,12 @@ jobs:
           # The container's stdout is not in the run log, so it leaves a trace on
           # the mount instead. Print it before deciding anything, so a failure
           # names the line it stopped on.
-          echo "--- container trace ---"
-          cat _trace.txt 2>&1 || echo "  (no trace at all: the container wrote nothing)"
+          echo "--- container trace (mount) ---"
+          cat _trace.txt 2>&1 || echo "  (no trace on the mount)"
+          echo "--- container trace (final copy) ---"
+          cat _trace-final.txt 2>&1 || echo "  (no final copy: the container stopped before the end)"
+          echo "--- workspace at start of build step ---"
+          ls -la . 2>&1 || true
           echo "--- binaries ---"
           ls -la "$OUT" 2>&1 || true
           echo "------------------------"
