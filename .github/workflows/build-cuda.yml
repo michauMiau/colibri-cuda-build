@@ -188,34 +188,23 @@ jobs:
               cat binaries/cuda-${{ matrix.cuda_version_short }}/.colibri-commit
               
               echo '=== Configuring build with Ninja ==='
-              # LIBRARY_PATH is load-bearing, not cargo cult. c/Makefile line 604
-              # is "LDFLAGS += -lcuda" with no -L, so the stubs directory has to
-              # be on the linker's search path some other way. The usual append
-              # guard cannot be used here, because it is an expansion and this
-              # whole body is one double-quoted argument to bash -c where the
-              # runner resolves those itself. Writing that guard in this comment
-              # was itself the failure: the runner expanded it, produced an
-              # empty assignment, and the container died with "bad
-              # substitution" before doing anything. Never put a shell expansion
-              # in a comment inside this argument, and never in prose that looks
-              # like one.
-              #
-              # Prepending in the runner is harmless: the runner has no CUDA of
-              # its own, so there is nothing useful in the inherited value, and
-              # the stubs path comes first either way.
-              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:$LIBRARY_PATH"
-
-              # The stubs directory is where the linker finds libcuda, because
-              # c/Makefile line 604 is "LDFLAGS += -lcuda" with no -L. The
-              # soname symlink is not present in the 12.8.1 image, and
-              # `ln -sf` does not create the containing directory, so without
-              # the mkdir below this failed with
+              # Prove the search path instead of assuming it. The soname symlink
+              # this used to create is not in the 12.8.1 image, and `ln -sf` does
+              # not create the containing directory, so run 36989594064 died with
               #   ln: failed to create symbolic link .../libcuda.so.1:
               #       No such file or directory
-              # and set -e took the container down before it built anything.
-              # -sf already tolerates the destination existing.
-              mkdir -p /usr/local/cuda/lib64/stubs
-              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+              # and the mkdir added as a fix hit
+              #   mkdir: cannot create directory '/usr/local/cuda': Permission denied
+              # because the container does not run as root. So the directory is
+              # not created and the symlink is not made; what has to be checked
+              # instead is whether libcuda is resolvable without them.
+              echo "--- cuda tree as the container sees it ---"
+              ls -ld /usr/local/cuda 2>&1
+              ls -l /usr/local/cuda/lib64 2>&1 | head -20
+              echo "--- stubs ---"
+              ls -l /usr/local/cuda/lib64/stubs 2>&1
+              echo "--- is libcuda resolvable at all? ---"
+              ldconfig -p 2>/dev/null | grep -c libcuda || echo "0"
               # CUDA_ARCH=portable is mandatory here, not an optimisation. The
               # runner has no GPU, so nvcc cannot resolve -arch=native and
               # silently falls back to a single default arch -- the shipped
