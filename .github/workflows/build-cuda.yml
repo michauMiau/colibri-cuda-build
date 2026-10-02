@@ -296,6 +296,35 @@ jobs:
               
               echo '=== Cleaning up build directory ==='
               rm -rf colibri
+              # The container's stdout does not reach the run log on this
+              # runner: every line it prints appears only inside the echoed
+              # script block. So the last thing it does is write what it saw to
+              # a file on the shared workspace, which the next step can read.
+              # Run 36995598263 ended with the build step successful and the
+              # bundling step unable to find cuda-runtime/, which cannot both be
+              # true of one directory. This records where the container wrote
+              # and what it believes it left behind. No substitution is used,
+              # because any of those are resolved by the runner instead.
+              {
+                date -u +%H:%M:%S > /workspace/_diag-time.txt
+                echo "container wrote at: " > /workspace/_container-diag.txt
+                cat /workspace/_diag-time.txt >> /workspace/_container-diag.txt
+                echo "cwd inside container: " >> /workspace/_container-diag.txt
+                pwd >> /workspace/_container-diag.txt
+                echo "mounts seen:" >> /workspace/_container-diag.txt
+                grep ' /workspace ' /proc/mounts >> /workspace/_container-diag.txt 2>&1 || \
+                  echo "  /workspace NOT in /proc/mounts" >> /workspace/_container-diag.txt
+                echo "top level of /workspace:" >> /workspace/_container-diag.txt
+                ls -la /workspace >> /workspace/_container-diag.txt 2>&1
+                echo "binaries tree:" >> /workspace/_container-diag.txt
+                find /workspace/binaries -maxdepth 3 >> /workspace/_container-diag.txt 2>&1 | head -40
+                echo "cuda-runtime:" >> /workspace/_container-diag.txt
+                ls -la /workspace/cuda-runtime >> /workspace/_container-diag.txt 2>&1
+                echo "stat of the staged file:" >> /workspace/_container-diag.txt
+                stat /workspace/cuda-runtime/libcudart.so.12 >> /workspace/_container-diag.txt 2>&1
+                rm -f /workspace/_diag-time.txt
+              }
+              cat /workspace/_container-diag.txt
             "
           
           # Remove Docker image to free space
