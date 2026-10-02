@@ -166,12 +166,25 @@ jobs:
               
               echo '=== Cloning Colibri ==='
               cd /workspace
-              # The release tag is the primary source. The commit from
-              # check-release is the fallback and is now a real sha rather than
-              # a branch name, so this checkout is reproducible.
+              # A trace on the mount, because this script's stdout does not reach
+              # the run log: every line it prints appears only inside the echoed
+              # script block. Runs 36994417357 through 36999714656 all reached the
+              # clone and then produced nothing, and each time the bundling step
+              # found binaries/ and cuda-runtime/ missing with colibri/ still
+              # present, which places the exit between the clone and Copying
+              # binaries. Four causes were guessed and none fit, because the log
+              # cannot say which line ran. This writes the line numbers, so the
+              # next run reports where it stopped. No substitution is used,
+              # since the runner would resolve those instead.
+              echo "1 cd /workspace" > /workspace/_trace.txt
+              pwd >> /workspace/_trace.txt
               git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/JustVugg/colibri.git || \
                 (git clone https://github.com/JustVugg/colibri.git && cd colibri && git checkout ${{ needs.check-release.outputs.release_hash }})
+              echo "2 clone returned" >> /workspace/_trace.txt
+              ls -d colibri >> /workspace/_trace.txt
               cd colibri
+              echo "3 cd colibri" >> /workspace/_trace.txt
+              pwd >> /workspace/_trace.txt
               # Every line here is built with `cat` and redirection, never with
               # a substitution. This block lives inside the one double-quoted
               # argument to bash -c, so the runner's shell expands a substitution and
@@ -206,7 +219,9 @@ jobs:
               # -o pipefail BEFORE the pipe: set after it, the flag never
               # applies to the pipeline and a failed make exits 0 via tee.
               set -o pipefail
+              echo "4 before make" >> /workspace/_trace.txt
               CUDA=1 CUDA_ARCH=portable make -C c qwen38 2>&1 | tee /tmp/build.log
+              echo "5 after make" >> /workspace/_trace.txt
 
               #echo '=== Building with Ninja (parallel: all cores) ==='
               #make --build build --config Release -j\nproc
@@ -319,6 +334,12 @@ jobs:
           patchelf --version
 
           OUT="binaries/cuda-${{ matrix.cuda_version_short }}"
+          # The container's stdout is not in the run log, so it leaves a trace on
+          # the mount instead. Print it before deciding anything, so a failure
+          # names the line it stopped on.
+          echo "--- container trace ---"
+          cat _trace.txt 2>&1 || echo "  (no trace: the container died before the first line)"
+          echo "------------------------"
           RUNTIME=cuda-runtime/libcudart.so.12
           if [ ! -f "$RUNTIME" ]; then
             echo "!!! $RUNTIME not staged by the container step" >&2
