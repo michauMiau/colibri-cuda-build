@@ -172,25 +172,37 @@ jobs:
               git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/JustVugg/colibri.git || \
                 (git clone https://github.com/JustVugg/colibri.git && cd colibri && git checkout ${{ needs.check-release.outputs.release_hash }})
               cd colibri
-              # Record what was actually built, not what was requested. A tag
-              # and a commit can disagree if the tag moved after the gate ran.
-              echo "=== Source under build ==="
-              echo "  HEAD:     $(git rev-parse HEAD)"
+              # Every line here is built with `cat` and redirection, never with
+              # a substitution. This block lives inside the one double-quoted
+              # argument to bash -c, so the runner's shell expands $( ) and
+              # ${ } before the container exists. Run 36988301671 died from
+              # exactly that: $(git rev-parse HEAD) was resolved against
+              # colibri-cuda-build's own checkout, not the Colibri clone, the
+              # comparison failed, and the container aborted before it staged
+              # the runtime. The symptom appeared two steps later as a
+              # misleading "cuda-runtime not staged".
+              echo '=== Source under build ==='
+              echo "  tag:      ${{ needs.check-release.outputs.release_tag }}"
               echo "  expected: ${{ needs.check-release.outputs.release_hash }}"
-              # Compare only the prefix, because the tag clone and the ref
-              # lookup resolve annotated tags through different paths and the
-              # shas may differ in length. A real mismatch still fails here
-              # rather than in an artifact nobody notices.
-              case "$(git rev-parse HEAD)" in
-                "${{ needs.check-release.outputs.release_hash }}"*) ;;
-                *)
-                  echo "!!! built a different commit than the gate resolved" >&2
-                  exit 1
-                  ;;
-              esac
+              git rev-parse HEAD > binaries/cuda-${{ matrix.cuda_version_short }}/.colibri-commit
+              cat binaries/cuda-${{ matrix.cuda_version_short }}/.colibri-commit
               
               echo '=== Configuring build with Ninja ==='
-              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+              # LIBRARY_PATH is load-bearing, not cargo cult. c/Makefile line 604
+              # is `LDFLAGS += -lcuda` with no -L, so the stubs directory has to
+              # be on the linker's search path some other way. It is also why
+              # the line below cannot use the usual
+              # ${LIBRARY_PATH:+:$LIBRARY_PATH} guard: that is an expansion, and
+              # this whole body is one double-quoted argument to bash -c, so the
+              # runner resolves it against the RUNNER's environment and the
+              # container inherits a path belonging to a different machine.
+              #
+              # Prepending in the runner is harmless here, because the runner has
+              # no CUDA of its own: the inherited value is whatever
+              # colibri-cuda-build happens to export, and the stubs path comes
+              # first either way. That is deliberate, not an oversight: the only
+              # entries are the container's own stubs plus an empty string.
+              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:$LIBRARY_PATH"
 
               ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
               # CUDA_ARCH=portable is mandatory here, not an optimisation. The
@@ -252,11 +264,13 @@ jobs:
               ls -l /workspace/cuda-runtime/
 
               echo '=== Creating version info ==='
+              # No $(date) here. It would be expanded by the runner rather than
+              # the container, which happens to give the same day but is the
+              # runner's clock and timezone, not the build's. The bundling step
+              # appends the real build date where the shell is the runner's own.
               echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Colibri commit: $(git rev-parse HEAD)' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
 
               echo '=== Build complete ==='
               ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
@@ -299,6 +313,41 @@ jobs:
             echo "!!! $RUNTIME not staged by the container step" >&2
             exit 1
           fi
+
+          # The container wrote the commit it actually built into this file.
+          # The comparison is here, not in the container, because that step's
+          # body is one double-quoted argument to bash -c where the runner
+          # expands $( ) and ${ } itself; see the comment at the clone.
+          BUILT_COMMIT_FILE="$OUT/.colibri-commit"
+          BUILT_COMMIT=$(cat "$BUILT_COMMIT_FILE" 2>/dev/null || echo '')
+          EXPECTED_COMMIT="${{ needs.check-release.outputs.release_hash }}"
+          if [ -z "$BUILT_COMMIT" ]; then
+            echo "!!! no commit recorded in $BUILT_COMMIT_FILE" >&2
+            exit 1
+          fi
+          case "$BUILT_COMMIT" in
+            "$EXPECTED_COMMIT"*) ;;
+            *)
+              echo "!!! built $BUILT_COMMIT but the gate resolved $EXPECTED_COMMIT" >&2
+              exit 1
+              ;;
+          esac
+          echo "commit check: $BUILT_COMMIT matches the gate"
+          # It has served its purpose in the tarball, where VERSION.txt is the
+          # place a user looks. Appended here, from the sha the build recorded,
+          # so the file cannot claim a commit the build did not use. Writing it
+          # in the container would need a $( ) that the runner would expand
+          # against its own repository.
+          echo "Colibri commit: $BUILT_COMMIT" >> "$OUT/VERSION.txt"
+          # The build date is taken here, where the shell really is the
+          # runner's, rather than inside the container body where $(date) would
+          # be the runner's too but by way of an expansion nobody can see.
+          echo "Build date: $(date -u +%Y-%m-%d)" >> "$OUT/VERSION.txt"
+          rm -f "$BUILT_COMMIT_FILE"
+
+          echo "--- VERSION.txt as shipped ---"
+          cat "$OUT/VERSION.txt"
+          echo "----------------------------"
           mkdir -p "$OUT/lib"
           install -m 0755 "$RUNTIME" "$OUT/lib/libcudart.so.12"
           echo "bundled $(du -h "$OUT/lib/libcudart.so.12" | cut -f1)"
