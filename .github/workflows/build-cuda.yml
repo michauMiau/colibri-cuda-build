@@ -205,6 +205,16 @@ jobs:
               # the stubs path comes first either way.
               export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:$LIBRARY_PATH"
 
+              # The stubs directory is where the linker finds libcuda, because
+              # c/Makefile line 604 is "LDFLAGS += -lcuda" with no -L. The
+              # soname symlink is not present in the 12.8.1 image, and
+              # `ln -sf` does not create the containing directory, so without
+              # the mkdir below this failed with
+              #   ln: failed to create symbolic link .../libcuda.so.1:
+              #       No such file or directory
+              # and set -e took the container down before it built anything.
+              # -sf already tolerates the destination existing.
+              mkdir -p /usr/local/cuda/lib64/stubs
               ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
               # CUDA_ARCH=portable is mandatory here, not an optimisation. The
               # runner has no GPU, so nvcc cannot resolve -arch=native and
