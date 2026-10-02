@@ -327,9 +327,21 @@ jobs:
           patchelf --version
 
           OUT="binaries/cuda-${{ matrix.cuda_version_short }}"
+          # List the tree BEFORE anything is created or removed. The container's
+          # own stdout is absent from the run log on this runner, so the only
+          # place that can show what survived the build step is here, on the
+          # workspace it shares with the container.
+          echo "--- workspace as the runner sees it ---"
+          ls -la .
+          echo "--- cuda-runtime ---"
+          ls -la cuda-runtime 2>&1
+          echo "--- $OUT ---"
+          ls -la "$OUT" 2>&1
+          echo "--------------------------------"
           RUNTIME=cuda-runtime/libcudart.so.12
           if [ ! -f "$RUNTIME" ]; then
             echo "!!! $RUNTIME not staged by the container step" >&2
+            echo "!!! the tree above shows what the build step left behind" >&2
             exit 1
           fi
 
