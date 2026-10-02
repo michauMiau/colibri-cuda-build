@@ -184,8 +184,8 @@ jobs:
               echo '=== Source under build ==='
               echo "  tag:      ${{ needs.check-release.outputs.release_tag }}"
               echo "  expected: ${{ needs.check-release.outputs.release_hash }}"
-              git rev-parse HEAD > binaries/cuda-${{ matrix.cuda_version_short }}/.colibri-commit
-              cat binaries/cuda-${{ matrix.cuda_version_short }}/.colibri-commit
+              git rev-parse HEAD > /workspace/.colibri-commit
+              cat /workspace/.colibri-commit
               
               echo '=== Configuring build with Ninja ==='
               # Prove the search path instead of assuming it. The soname symlink
@@ -244,43 +244,39 @@ jobs:
               #find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
               echo '=== Staging the CUDA runtime for the bundling step ==='
-              # Assert the staging HERE, inside the container, where the source
-              # and the destination can both be seen. The bundling step found
-              # cuda-runtime/libcudart.so.12 missing and could only report
-              # that, with no way to say whether the copy never ran, ran against
-              # a glob that matched nothing, or ran and something removed it.
+              # The bundling step failed twice on "cuda-runtime not staged" with
+              # no way to tell why, so the copy is checked here where both ends
+              # are visible. Every probe below has to tolerate its own absence:
+              # under set -e a plain `ls` on a path that does not exist yet ends
+              # the container, which is what a previous version of this block
+              # did on the line before the mkdir, and it cost two runs before
+              # that showed up.
               #
-              # Run 36994417357 built successfully and then failed two steps
-              # later on exactly this, and the log did not contain the
-              # container's stdout at all, so there was nothing to read. Each
-              # check below names the thing it rules out.
-              echo "  glob result:"
-              ls -l /usr/local/cuda/lib64/libcudart.so.12.* 2>&1
-              echo "  staging dir before copy:"
-              ls -ld /workspace/cuda-runtime 2>&1
+              # The versioned soname is copied, not the libcudart.so.12
+              # symlink: that symlink is a toolchain artifact and would dangle
+              # for anyone extracting the tarball without the toolkit.
               mkdir -p /workspace/cuda-runtime
+              echo "  source:"
+              ls -l /usr/local/cuda/lib64/libcudart.so.12.* 2>&1 || true
               cp -L /usr/local/cuda/lib64/libcudart.so.12.* \
                     /workspace/cuda-runtime/libcudart.so.12
               chmod 0755 /workspace/cuda-runtime/libcudart.so.12
-              # The versioned soname, not the libcudart.so.12 symlink: that
-              # symlink is a toolchain artifact and would dangle for anyone who
-              # extracts the tarball without the toolkit.
+              echo "  staged:"
               ls -l /workspace/cuda-runtime/
-              # Prove the copy landed and is a real library, not an empty file
-              # from a failed cp. Both failures reported above would pass a
-              # bare -f test, so the size is compared against the source.
-              echo "  source size:"
-              stat -c %s /usr/local/cuda/lib64/libcudart.so.12.* 2>&1
-              echo "  staged size:"
-              stat -c %s /workspace/cuda-runtime/libcudart.so.12
+              # A bare -f test passes an empty file left by a failed cp, so the
+              # staged size is compared with the source.
               if [ ! -s /workspace/cuda-runtime/libcudart.so.12 ]; then
                 echo "!!! staging produced an empty or missing file" >&2
                 exit 1
               fi
-              # Confirms it is an ELF shared object, so a bad copy is caught
-              # here rather than by a loader error on a user machine.
+              stat -c %s /usr/local/cuda/lib64/libcudart.so.12.* > /workspace/_src-size.txt 2>&1 || true
+              stat -c %s /workspace/cuda-runtime/libcudart.so.12
+              echo "  source size:"
+              cat /workspace/_src-size.txt
+              rm -f /workspace/_src-size.txt
+              # Confirms an ELF shared object, so a bad copy is caught here
+              # rather than as a loader error on a user machine.
               file /workspace/cuda-runtime/libcudart.so.12 2>&1 || true
-              echo "=== Staging verified ==="
 
               echo '=== Creating version info ==='
               # No the date here. It would be expanded by the runner rather than
@@ -296,35 +292,6 @@ jobs:
               
               echo '=== Cleaning up build directory ==='
               rm -rf colibri
-              # The container's stdout does not reach the run log on this
-              # runner: every line it prints appears only inside the echoed
-              # script block. So the last thing it does is write what it saw to
-              # a file on the shared workspace, which the next step can read.
-              # Run 36995598263 ended with the build step successful and the
-              # bundling step unable to find cuda-runtime/, which cannot both be
-              # true of one directory. This records where the container wrote
-              # and what it believes it left behind. No substitution is used,
-              # because any of those are resolved by the runner instead.
-              {
-                date -u +%H:%M:%S > /workspace/_diag-time.txt
-                echo "container wrote at: " > /workspace/_container-diag.txt
-                cat /workspace/_diag-time.txt >> /workspace/_container-diag.txt
-                echo "cwd inside container: " >> /workspace/_container-diag.txt
-                pwd >> /workspace/_container-diag.txt
-                echo "mounts seen:" >> /workspace/_container-diag.txt
-                grep ' /workspace ' /proc/mounts >> /workspace/_container-diag.txt 2>&1 || \
-                  echo "  /workspace NOT in /proc/mounts" >> /workspace/_container-diag.txt
-                echo "top level of /workspace:" >> /workspace/_container-diag.txt
-                ls -la /workspace >> /workspace/_container-diag.txt 2>&1
-                echo "binaries tree:" >> /workspace/_container-diag.txt
-                find /workspace/binaries -maxdepth 3 >> /workspace/_container-diag.txt 2>&1 | head -40
-                echo "cuda-runtime:" >> /workspace/_container-diag.txt
-                ls -la /workspace/cuda-runtime >> /workspace/_container-diag.txt 2>&1
-                echo "stat of the staged file:" >> /workspace/_container-diag.txt
-                stat /workspace/cuda-runtime/libcudart.so.12 >> /workspace/_container-diag.txt 2>&1
-                rm -f /workspace/_diag-time.txt
-              }
-              cat /workspace/_container-diag.txt
             "
           
           # Remove Docker image to free space
@@ -356,26 +323,13 @@ jobs:
           patchelf --version
 
           OUT="binaries/cuda-${{ matrix.cuda_version_short }}"
-          # List the tree BEFORE anything is created or removed. The container's
-          # own stdout is absent from the run log on this runner, so the only
-          # place that can show what survived the build step is here, on the
-          # workspace it shares with the container.
-          echo "--- workspace as the runner sees it ---"
-          ls -la .
-          echo "--- cuda-runtime ---"
-          # ls of a missing directory returns 2 and this step runs under -e, so
-          # the probe aborted the step before it could print the diagnostic the
-          # probe existed to collect. || true keeps the listing, drops the code.
-          ls -la cuda-runtime 2>&1 || true
-          echo "--- container's own view ---"
-          cat _container-diag.txt 2>&1 || echo "  (container wrote no diagnostic)"
-          echo "--- $OUT ---"
-          ls -la "$OUT" 2>&1 || true
-          echo "--------------------------------"
           RUNTIME=cuda-runtime/libcudart.so.12
           if [ ! -f "$RUNTIME" ]; then
             echo "!!! $RUNTIME not staged by the container step" >&2
-            echo "!!! the tree above shows what the build step left behind" >&2
+            echo "--- workspace ---"
+            ls -la . || true
+            echo "--- binaries ---"
+            ls -la "$OUT" 2>&1 || true
             exit 1
           fi
 
@@ -383,7 +337,7 @@ jobs:
           # The comparison is here, not in the container, because that step's
           # body is one double-quoted argument to bash -c where the runner
           # expands $( ) and ${ } itself; see the comment at the clone.
-          BUILT_COMMIT_FILE="$OUT/.colibri-commit"
+          BUILT_COMMIT_FILE=".colibri-commit"
           BUILT_COMMIT=$(cat "$BUILT_COMMIT_FILE" 2>/dev/null || echo '')
           EXPECTED_COMMIT="${{ needs.check-release.outputs.release_hash }}"
           if [ -z "$BUILT_COMMIT" ]; then
