@@ -28,17 +28,52 @@ jobs:
       - name: Check for new Colibri release
         id: check
         run: |
-          # Get latest release from colibri
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.tag_name')
-          RELEASE_HASH=$(curl -s https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.target_commitish')
-          
+          set -euo pipefail
+
+          # Latest published release from upstream.
+          LATEST_RELEASE=$(curl -sf https://api.github.com/repos/JustVugg/colibri/releases/latest | jq -r '.tag_name')
+          if [ -z "$LATEST_RELEASE" ] || [ "$LATEST_RELEASE" = "null" ]; then
+            echo "!!! could not read the upstream release tag" >&2
+            exit 1
+          fi
+
+          # The commit the release was cut from, not target_commitish.
+          #
+          # target_commitish is the BRANCH a release was published from, so for
+          # an ordinary release it reads "main". It was being written into
+          # VERSION.txt as "Build hash: main", into the release body as
+          # "Build commit: main", and used as the checkout ref in the clone
+          # fallback, none of which is a fixed source. A branch moves, so two
+          # builds of the same tag could come from different trees.
+          #
+          # The tag ref may be an annotated tag object rather than a commit, so
+          # dereference it. Verified: git/ref/tags/v1.12.1 is a "tag" object
+          # whose object is commit ce370e87, and that is exactly what
+          # `git clone --branch v1.12.1` checks out.
+          TAG_OBJECT=$(curl -sf "https://api.github.com/repos/JustVugg/colibri/git/ref/tags/${LATEST_RELEASE}" | jq -r '.object.sha')
+          if [ -z "$TAG_OBJECT" ] || [ "$TAG_OBJECT" = "null" ]; then
+            echo "!!! could not resolve the ref for $LATEST_RELEASE" >&2
+            exit 1
+          fi
+          TAG_TYPE=$(curl -sf "https://api.github.com/repos/JustVugg/colibri/git/ref/tags/${LATEST_RELEASE}" | jq -r '.object.type')
+          if [ "$TAG_TYPE" = "tag" ]; then
+            RELEASE_HASH=$(curl -sf "https://api.github.com/repos/JustVugg/colibri/git/tags/${TAG_OBJECT}" | jq -r '.object.sha')
+          else
+            RELEASE_HASH="$TAG_OBJECT"
+          fi
+          if [ -z "$RELEASE_HASH" ] || [ "$RELEASE_HASH" = "null" ]; then
+            echo "!!! could not resolve a commit for $LATEST_RELEASE" >&2
+            exit 1
+          fi
+
           echo "Latest colibri release: $LATEST_RELEASE"
-          echo "Release hash: $RELEASE_HASH"
-          
-          # Check if we've already built this release
+          echo "Release commit: $RELEASE_HASH"
+
+          # Anchored on purpose. Unanchored, v1.12.1 would also match v1.12.10
+          # and v1.12.1-rc1, and a genuinely new release would be skipped.
           if git tag | grep -q "^${LATEST_RELEASE}$"; then
             echo "Release $LATEST_RELEASE already built"
-            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+            if [ "${{ inputs.force_build }}" = "true" ]; then
               echo "Force build enabled, building anyway"
               echo "should_build=true" >> $GITHUB_OUTPUT
             else
@@ -48,7 +83,7 @@ jobs:
             echo "New release detected: $LATEST_RELEASE"
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
-          
+
           echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
           echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
 
@@ -131,9 +166,28 @@ jobs:
               
               echo '=== Cloning Colibri ==='
               cd /workspace
+              # The release tag is the primary source. The commit from
+              # check-release is the fallback and is now a real sha rather than
+              # a branch name, so this checkout is reproducible.
               git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/JustVugg/colibri.git || \
                 (git clone https://github.com/JustVugg/colibri.git && cd colibri && git checkout ${{ needs.check-release.outputs.release_hash }})
               cd colibri
+              # Record what was actually built, not what was requested. A tag
+              # and a commit can disagree if the tag moved after the gate ran.
+              echo "=== Source under build ==="
+              echo "  HEAD:     $(git rev-parse HEAD)"
+              echo "  expected: ${{ needs.check-release.outputs.release_hash }}"
+              # Compare only the prefix, because the tag clone and the ref
+              # lookup resolve annotated tags through different paths and the
+              # shas may differ in length. A real mismatch still fails here
+              # rather than in an artifact nobody notices.
+              case "$(git rev-parse HEAD)" in
+                "${{ needs.check-release.outputs.release_hash }}"*) ;;
+                *)
+                  echo "!!! built a different commit than the gate resolved" >&2
+                  exit 1
+                  ;;
+              esac
               
               echo '=== Configuring build with Ninja ==='
               export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
@@ -201,8 +255,8 @@ jobs:
               echo 'Colibri version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Colibri commit: $(git rev-parse HEAD)' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
 
               echo '=== Build complete ==='
               ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
@@ -415,7 +469,7 @@ jobs:
             Prebuilt `qwen38` and `coli` from JustVugg/colibri, compiled for CUDA 12.8.
 
             **Source:** https://github.com/JustVugg/colibri/releases/tag/${{ needs.check-release.outputs.release_tag }}
-            **Build commit:** ${{ needs.check-release.outputs.release_hash }}
+            **Colibri commit:** `${{ needs.check-release.outputs.release_hash }}`
 
             ## GPU support
 
@@ -436,6 +490,24 @@ jobs:
             ## Host architecture
 
             x86-64 only. There is no arm64 tarball.
+
+            ## What you need on the host
+
+            No CUDA toolkit. The one CUDA library the binary loads ships in
+            `cuda-12.8/lib/`, and RUNPATH points at it, so `./qwen38` runs as
+            downloaded.
+
+            Still required from the system, because they are not bundled:
+            glibc 2.34 or newer, `libgomp.so.1` (the OpenMP runtime the CUDA
+            build links) and `libstdc++.so.6`. A slim image may lack them:
+
+            ```bash
+            apt install libgomp1 libstdc++6   # Debian, Ubuntu
+            dnf install libgomp libstdc++     # Fedora, RHEL
+            ```
+
+            `qwen38` is a glibc binary, so it will not run on musl-based
+            systems.
 
             ## Usage
 

@@ -59,7 +59,23 @@ compiled with 12.8.
 - NVIDIA GPU, compute capability 8.0 or newer
 - NVIDIA driver 570.15 or newer, for CUDA 12.8
 - Linux x86-64
+- glibc 2.34 or newer
 - No CUDA toolkit. The one shared library the binary needs is in the tarball.
+
+The binary also links `libgomp.so.1` and `libstdc++.so.6`, and neither is
+bundled: `libgomp` is the OpenMP runtime and `libstdc++` belongs to the system
+toolchain, so both are the system's business rather than CUDA's. A slim Debian
+or Ubuntu image may not have them. If `qwen38` fails with
+`error while loading shared libraries: libgomp.so.1` or the same for
+`libstdc++.so.6`:
+
+```bash
+apt install libgomp1 libstdc++6   # Debian, Ubuntu
+dnf install libgomp libstdc++     # Fedora, RHEL
+```
+
+`qwen38` is a glibc binary. It will not run on musl-based systems, so Alpine
+needs `gcompat` and may still fail. Use a glibc distribution.
 
 ## Usage
 
