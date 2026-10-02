@@ -214,7 +214,12 @@ jobs:
               echo '=== Copying binaries ==='
               cd /workspace
               mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
-              
+              # Move the commit record out of the clone and into the output
+              # directory now, while binaries/ exists and before the clone is
+              # removed. Written next to the clone it survived only as long as
+              # the clone did, and the clone is deleted at the end of this
+              # script, which is where run 36999192814 lost it.
+              cp /workspace/.colibri-commit binaries/cuda-${{ matrix.cuda_version_short }}/.colibri-commit
               # Remove everything except binaries
               rm -fr colibri/c/*.c 
               rm -fr colibri/c/*.h
@@ -328,7 +333,11 @@ jobs:
           # The comparison is here, not in the container, because that step's
           # body is one double-quoted argument to bash -c where the runner
           # expands $( ) and ${ } itself; see the comment at the clone.
-          BUILT_COMMIT_FILE=".colibri-commit"
+          # Inside the output directory, which the container creates early and the
+          # bundling step packs. Earlier versions put it in the workspace root
+          # or beside the clone, and the clone is deleted at the end of the
+          # container's script, so it was gone by the time this step ran.
+          BUILT_COMMIT_FILE="$OUT/.colibri-commit"
           BUILT_COMMIT=$(cat "$BUILT_COMMIT_FILE" 2>/dev/null || echo '')
           EXPECTED_COMMIT="${{ needs.check-release.outputs.release_hash }}"
           if [ -z "$BUILT_COMMIT" ]; then
